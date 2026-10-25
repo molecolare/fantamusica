@@ -224,6 +224,28 @@ def classifica_giocatori(db):
     return [(ps, n, p) for ps, (n, p) in zip(pos, dati)]
 
 
+def riempi_buco(db, chiave, contatore, vuoto):
+    """Dopo una rimozione l'ID 'vuoto' resta libero: l'elemento con l'ID più alto lo prende
+    al suo posto, così gli ID restano consecutivi. Restituisce (vecchio_id, nuovo_id)
+    se un elemento è stato spostato, altrimenti None. Aggiorna anche il contatore."""
+    lista = db[chiave]
+    spostato = None
+    if lista:
+        ultimo = max(lista, key=lambda x: x["id"])
+        if ultimo["id"] > vuoto:
+            spostato = (ultimo["id"], vuoto)
+            ultimo["id"] = vuoto
+            lista.sort(key=lambda x: x["id"])
+    db["contatori"][contatore] = max((x["id"] for x in lista), default=0) + 1
+    return spostato
+
+
+def eventi_recenti(db, n, filtro=None):
+    """Gli ultimi n eventi (più recente per primo), ordinati per data."""
+    ev = [e for e in db["eventi"] if filtro is None or filtro(e)]
+    return sorted(ev, key=lambda e: (e["data"], e["id"]), reverse=True)[:n]
+
+
 def campi_per(db, per):
     """Caratteristiche definite per 'musicisti' o 'giocatori'."""
     return [c for c in db["campi"] if c["per"] == per]
@@ -524,7 +546,7 @@ class Gioco:
             print("Nessun evento registrato.")
             return
         print("\nUltimi 15 eventi")
-        self.tabella_eventi(list(reversed(ev[-15:])))
+        self.tabella_eventi(eventi_recenti(self.db, 15))
 
     # ---------- profili (consultazione, per tutti) ----------
     def menu_profili(self):
@@ -558,10 +580,10 @@ class Gioco:
             print("  Squadra: nessuna (libero)")
         print(f"  Punti:   {p:+d} ({pct(p, tot)} dei punti totali)")
         self.stampa_caratteristiche(m, "musicisti")
-        recenti = [e for e in db["eventi"] if e["musicista_id"] == m["id"]][-5:]
+        recenti = eventi_recenti(db, 5, lambda e: e["musicista_id"] == m["id"])
         if recenti:
             print("\nUltimi eventi")
-            self.tabella_eventi(list(reversed(recenti)))
+            self.tabella_eventi(recenti)
 
     def profilo_giocatore(self):
         db = self.db
@@ -690,10 +712,11 @@ class Gioco:
         if not ev:
             print("Nessun evento registrato.")
             return
-        self.tabella_eventi(list(reversed(ev[-15:])))
+        self.tabella_eventi(eventi_recenti(self.db, 15))
         e = self.scegli_per_id(ev, "ID evento da eliminare (invio per annullare): ")
         if e and ask("Confermi? (s/N) ").lower() == "s":
             ev.remove(e)
+            riempi_buco(self.db, "eventi", "evento", e["id"])
             print("Evento eliminato: i punti sono stati tolti alla squadra.")
 
     # ----- asta -----
@@ -865,6 +888,12 @@ class Gioco:
             print("Ha eventi registrati: eliminali prima oppure lascialo in elenco.")
         elif ask(f"Rimuovere {m['nome']}? (s/N) ").lower() == "s":
             db["musicisti"].remove(m)
+            sp = riempi_buco(db, "musicisti", "musicista", m["id"])
+            if sp:
+                for e in db["eventi"]:
+                    if e["musicista_id"] == sp[0]:
+                        e["musicista_id"] = sp[1]
+                print(f"Il musicista con ID {sp[0]} ora ha ID {sp[1]}.")
 
     @solo_admin
     def svincola_musicista(self):
@@ -961,7 +990,17 @@ class Gioco:
         self.elenco_azioni()
         a = self.scegli_per_id(self.db["azioni"], "ID azione da eliminare (invio per annullare): ")
         if a and ask(f"Eliminare '{a['nome']}'? (s/N) ").lower() == "s":
-            self.db["azioni"].remove(a)
+            db = self.db
+            for e in db["eventi"]:
+                if e.get("azione_id") == a["id"]:
+                    e["azione_id"] = None  # lo storico conserva il nome dell'azione
+            db["azioni"].remove(a)
+            sp = riempi_buco(db, "azioni", "azione", a["id"])
+            if sp:
+                for e in db["eventi"]:
+                    if e.get("azione_id") == sp[0]:
+                        e["azione_id"] = sp[1]
+                print(f"L'azione con ID {sp[0]} ora ha ID {sp[1]}.")
 
     # ----- utenti -----
     @solo_admin
@@ -1095,6 +1134,12 @@ class Gioco:
         for p in compilati:
             del p["profilo"][str(c["id"])]
         db["campi"].remove(c)
+        sp = riempi_buco(db, "campi", "campo", c["id"])
+        if sp:
+            for pr in profili_di(db, next(x["per"] for x in db["campi"] if x["id"] == sp[1])):
+                if str(sp[0]) in pr.get("profilo", {}):
+                    pr["profilo"][str(sp[1])] = pr["profilo"].pop(str(sp[0]))
+            print(f"La caratteristica con ID {sp[0]} ora ha ID {sp[1]}.")
         print("Caratteristica eliminata.")
 
     @solo_admin
