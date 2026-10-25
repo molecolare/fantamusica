@@ -26,7 +26,8 @@ Come si calcolano i punti di un'azione (scelto alla creazione dell'azione)
   con arrotondamento per difetto (verso il basso, anche per i negativi).
   Un'azione puo' prevedere piu' musicisti, ciascuno con il proprio ruolo e punteggio
   (definiti alla creazione); alla registrazione si possono aggiungere altri musicisti
-  coinvolti con un punteggio libero.
+  coinvolti con un punteggio libero (come punteggio base: anche a loro si applicano i bonus/malus
+  scelti).
   DITTATURA: l'admin puo' inserire un evento con il punteggio deciso a mano.
 
 Mercato
@@ -47,13 +48,16 @@ Ruoli
                   all'accesso, recupero password...)
 
 Avvio:  python3 fantamusica.py
-I dati sono salvati in fantamusica_dati.json (accanto allo script).
+I dati sono salvati in fantamusica_dati.json (accanto allo script). Il pannello admin ha
+"Backup ed esportazione": backup datati (cartella backup/, anche in automatico a ogni chiusura
+stagione), ripristino, esportazione/importazione dell'intero database e CSV di classifiche ed eventi.
 I salvataggi delle versioni precedenti vengono aggiornati in automatico all'apertura.
 """
 import copy
 import functools
 import getpass
 import hashlib
+import csv
 import json
 import math
 import os
@@ -640,6 +644,115 @@ def classifica_cumulativa(db, includi_corrente=True):
 
 
 # ----- recupero password -----
+# ----- backup ed esportazione -----
+CHIAVI_OBBLIGATORIE = ("impostazioni", "utenti", "musicisti", "azioni", "eventi", "contatori")
+
+
+def cartella_backup():
+    return DATA_FILE.parent / "backup"
+
+
+def cartella_esportazioni():
+    return DATA_FILE.parent / "esportazioni"
+
+
+def percorso_libero(cartella, nome):
+    """cartella/nome, con un numero in coda se esiste gia' (due backup nello stesso secondo)."""
+    p = cartella / nome
+    n = 2
+    while p.exists():
+        p = cartella / f"{Path(nome).stem}-{n}{Path(nome).suffix}"
+        n += 1
+    return p
+
+
+def scrivi_json(db, percorso):
+    percorso.parent.mkdir(parents=True, exist_ok=True)
+    with open(percorso, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+    return percorso
+
+
+def crea_backup(db, motivo="manuale"):
+    """Copia datata del database nella cartella 'backup' accanto ai dati. Ritorna il percorso."""
+    nome = f"{DATA_FILE.stem}_{motivo}_{datetime.now():%Y%m%d-%H%M%S}.json"
+    return scrivi_json(db, percorso_libero(cartella_backup(), nome))
+
+
+def elenco_backup():
+    """I backup esistenti, dal piu' recente."""
+    cart = cartella_backup()
+    if not cart.is_dir():
+        return []
+    return sorted(cart.glob(f"{DATA_FILE.stem}_*.json"), key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+
+
+def leggi_database(percorso):
+    """Legge e controlla un file di database. Ritorna (db migrato, errore o None)."""
+    try:
+        with open(percorso, encoding="utf-8") as f:
+            dati = json.load(f)
+    except OSError as e:
+        return None, f"Impossibile leggere il file: {e.strerror or e}"
+    except ValueError:
+        return None, "Il file non è un JSON valido."
+    if not isinstance(dati, dict) or any(not isinstance(dati.get(k), (dict, list)) for k in CHIAVI_OBBLIGATORIE):
+        return None, "Il file non sembra un database di FantaBanda."
+    try:
+        migra(dati)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None, "Il database nel file è incompleto o danneggiato."
+    return dati, None
+
+
+def righe_csv(db):
+    """{nome file: (intestazioni, righe)} con classifiche ed eventi."""
+    cmus, cgio = campi_per(db, "musicisti"), campi_per(db, "giocatori")
+
+    def car(elemento, campi):
+        return [elemento.get("profilo", {}).get(str(c["id"]), "") for c in campi]
+
+    gio = []
+    for pos, nome, punti in classifica_giocatori(db):
+        u = utente(db, nome)
+        gio.append([pos, nome, prefs(u)["soprannome"], punti, crediti(db, nome),
+                    ", ".join(m["nome"] for m in rosa(db, nome))] + car(u, cgio))
+    dati = sorted(((m, punti_musicista(db, m["id"])) for m in db["musicisti"]),
+                  key=lambda x: (-x[1], x[0]["nome"].lower()))
+    mus = [[ps, m["nome"], m.get("soprannome", ""), m["proprietario"] or "", m["prezzo"] if m["proprietario"] else "",
+            p] + car(m, cmus)
+           for ps, (m, p) in zip(posizioni([p for _, p in dati]), dati)]
+    nomi = {m["id"]: m["nome"] for m in db["musicisti"]}
+    ev = [[e["id"], e["data"], e["stato"], nomi.get(e["musicista_id"], "?"), e["azione"], e.get("ruolo", ""),
+           e["punti"], "" if e.get("base") is None else e["base"],
+           ", ".join(descrivi_bonus(b) for b in e.get("bonus", [])),
+           " ".join(map(str, e.get("voti", []))), e.get("dettaglio", ""), e.get("proprietario") or "",
+           "sì" if e.get("dittatura") else "", e.get("gruppo") or "", e.get("nota", "")]
+          for e in db["eventi"]]
+    return {
+        "classifica_giocatori.csv": (["Posizione", "Giocatore", "Soprannome", "Punti", "Crediti", "Musicisti"]
+                                     + [c["nome"] for c in cgio], gio),
+        "classifica_musicisti.csv": (["Posizione", "Musicista", "Soprannome", "Squadra", "Prezzo", "Punti"]
+                                     + [c["nome"] for c in cmus], mus),
+        "eventi.csv": (["ID", "Data", "Stato", "Musicista", "Azione", "Ruolo", "Punti", "Base", "Bonus/malus",
+                        "Voti", "Dettaglio", "Squadra", "DITTATURA", "Gruppo", "Nota"], ev),
+    }
+
+
+def esporta_csv(db, cartella):
+    """Scrive i CSV (separatore ';', apribili con Excel); ritorna i percorsi."""
+    cartella.mkdir(parents=True, exist_ok=True)
+    scritti = []
+    for nome, (intestazioni, righe) in righe_csv(db).items():
+        p = cartella / nome
+        with open(p, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(intestazioni)
+            w.writerows(righe)
+        scritti.append(p)
+    return scritti
+
+
 def normalizza_risposta(s):
     return " ".join(s.lower().split())
 
@@ -799,7 +912,6 @@ class Gioco:
             ("Classifica", self.menu_classifica),
             ("La mia squadra", lambda: self.dettaglio_squadra(self.me["nome"])),
             ("Mercato e scambi", self.menu_mercato),
-            ("Profili", self.menu_profili),
             ("Impostazioni", self.impostazioni),
             ("Cambia la mia password", self.cambia_password),
         ]
@@ -1064,7 +1176,10 @@ class Gioco:
                 Col("distacco", "Distacco", lambda r: r[2] - capo, ">",
                     fmt=lambda v, r: "-" if v == 0 else str(v), ordinabile=False),
                 Col("perc", "% punti", lambda r: r[2], ">", fmt=lambda v, r: pct(v, totale), ordinabile=False),
-                Col("rosa", "Rosa", lambda r: len(rosa(db, r[1])), ">", fmt=lambda v, r: f"{v}/{n_max}")]
+                Col("rosa", "Rosa", lambda r: len(rosa(db, r[1])), ">", fmt=lambda v, r: f"{v}/{n_max}"),
+                Col("crediti", "Crediti", lambda r: crediti(db, r[1]), ">"),
+                Col("musicisti", "Musicisti", lambda r: ", ".join(m["nome"] for m in rosa(db, r[1])) or None,
+                    ordinabile=False)]
         cols += self.colonne_campi("giocatori", lambda r: utente(db, r[1]))
         self.vista("cl_giocatori", cols, cl, ("pos", False),
                    f"\nClassifica giocatori - {db['impostazioni']['stagione']}")
@@ -1081,7 +1196,11 @@ class Gioco:
         righe = [(ps, m, p) for ps, (m, p) in zip(pos, dati)]
         cols = [Col("pos", "Pos", lambda r: r[0], ">"),
                 Col("nome", "Musicista", lambda r: r[1]["nome"]),
+                Col("soprannome", "Soprannome", lambda r: r[1].get("soprannome") or None),
+                Col("mio_sopr", "Il tuo soprannome",
+                    lambda r: prefs(self.me)["soprannomi_musicisti"].get(str(r[1]["id"])) or None),
                 Col("squadra", "Squadra", lambda r: r[1]["proprietario"]),
+                Col("prezzo", "Prezzo", lambda r: r[1]["prezzo"] if r[1]["proprietario"] else None, ">"),
                 Col("punti", "Punti", lambda r: r[2], ">"),
                 Col("perc", "% punti", lambda r: r[2], ">", fmt=lambda v, r: pct(v, tot), ordinabile=False)]
         cols += self.colonne_campi("musicisti", lambda r: r[1])
@@ -1241,39 +1360,6 @@ class Gioco:
                    "\nEventi in pending: il punteggio si decide dopo il sondaggio")
 
     # ---------- profili (consultazione, per tutti) ----------
-    def menu_profili(self):
-        self.menu("Profili", [("Musicisti", self.profili_musicisti), ("Giocatori", self.profili_giocatori)])
-
-    def profili_musicisti(self):
-        db = self.db
-        if not db["musicisti"]:
-            print("Nessun musicista.")
-            return
-        tot = sum(e["punti"] for e in eventi_ok(db))
-        cols = [Col("nome", "Musicista", lambda m: m["nome"]),
-                self.col_soprannome(), self.col_mio_soprannome(),
-                Col("squadra", "Squadra", lambda m: m["proprietario"]),
-                Col("prezzo", "Prezzo", lambda m: m["prezzo"] if m["proprietario"] else None, ">"),
-                Col("punti", "Punti", lambda m: punti_musicista(db, m["id"]), ">"),
-                Col("perc", "% punti", lambda m: punti_musicista(db, m["id"]), ">",
-                    fmt=lambda v, m: pct(v, tot), ordinabile=False)]
-        cols += self.colonne_campi("musicisti", lambda m: m)
-        self.vista("profili_musicisti", cols, db["musicisti"], ("nome", False), "\nProfili dei musicisti")
-
-    def profili_giocatori(self):
-        db = self.db
-        gio = giocatori(db)
-        if not gio:
-            print("Nessun giocatore.")
-            return
-        cols = [Col("nome", "Giocatore", lambda u: u["nome"], fmt=lambda v, u: etichetta_utente(db, v)),
-                Col("punti", "Punti", lambda u: punti_utente(db, u["nome"]), ">"),
-                Col("crediti", "Crediti", lambda u: crediti(db, u["nome"]), ">"),
-                Col("musicisti", "Musicisti", lambda u: ", ".join(m["nome"] for m in rosa(db, u["nome"])) or None,
-                    ordinabile=False)]
-        cols += self.colonne_campi("giocatori", lambda u: u)
-        self.vista("profili_giocatori", cols, gio, ("punti", True), "\nProfili dei giocatori")
-
     # ---------- impostazioni ----------
     # ---------- storico stagioni ----------
     def menu_storico(self):
@@ -1462,6 +1548,7 @@ class Gioco:
             ("Gestione utenti", self.menu_utenti),
             ("Caratteristiche dei profili", self.menu_campi),
             ("Elimina un evento", self.elimina_evento),
+            ("Backup ed esportazione", self.menu_backup),
             ("Chiudi la stagione (archivia e azzera)", self.chiudi_stagione),
         ])
 
@@ -1601,11 +1688,11 @@ class Gioco:
                 print("Annullato.")
                 return
             basi.append(risultato)
-        bonus = self.chiedi_bonus_da_applicare(a) if any(s for _, s in coppie) else []
+        bonus = self.chiedi_bonus_da_applicare(a)
         nota = ask("Nota (facoltativa): ")
         gruppo = prossimo_id(db, "gruppo") if len(coppie) > 1 else None
         for (m, s), (base, dettaglio, pending, voti) in zip(coppie, basi):
-            b = bonus if s else []
+            b = bonus
             punti = None if pending else calcola_punti(base, b)
             fascia = (s["min"], s["max"]) if s and a["modalita"] == "sondaggio" else None
             e = self.aggiungi_evento(m, a, punti, base, b, dettaglio, pending, nota, fascia=fascia,
@@ -2670,6 +2757,108 @@ class Gioco:
 
     # ----- nuova stagione -----
     @solo_admin
+    def menu_backup(self):
+        self.menu("Backup ed esportazione", [
+            ("Crea un backup ora", self.backup_manuale),
+            ("Ripristina da un backup", self.ripristina_backup),
+            ("Esporta tutto il database in un file", self.esporta_database),
+            ("Importa il database da un file", self.importa_database),
+            ("Esporta classifiche ed eventi in CSV", self.esporta_csv_menu),
+        ])
+
+    @solo_admin
+    def backup_manuale(self):
+        p = crea_backup(self.db, "manuale")
+        print(f"Backup creato: {p}")
+
+    def sostituisci_database(self, nuovo, etichetta):
+        """Sostituisce tutti i dati con 'nuovo' (dopo un backup di sicurezza dei dati attuali)."""
+        db = self.db
+        admin = utente(nuovo, self.me["nome"])
+        if not admin or admin["ruolo"] != "admin":
+            print(f"Operazione annullata: nel database scelto '{self.me['nome']}' non è un admin, "
+                  f"quindi perderesti l'accesso.")
+            return False
+        print(f"Il database scelto ({etichetta}) contiene {len(nuovo['utenti'])} utenti, "
+              f"{len(nuovo['musicisti'])} musicisti, {len(nuovo['eventi'])} eventi in "
+              f"'{nuovo['impostazioni'].get('stagione', '?')}'.")
+        print("TUTTI i dati attuali verranno sostituiti (ne viene fatto prima un backup).")
+        if ask("Scrivi SOSTITUISCI per confermare: ") != "SOSTITUISCI":
+            print("Annullato.")
+            return False
+        print(f"Backup dei dati attuali: {crea_backup(db, 'prima-del-ripristino')}")
+        db.clear()
+        db.update(nuovo)
+        self.me = utente(db, self.me["nome"])
+        self.salva()
+        print("Database sostituito.")
+        return True
+
+    @solo_admin
+    def ripristina_backup(self):
+        lista = elenco_backup()
+        if not lista:
+            print("Nessun backup trovato.")
+            return
+        for i, p in enumerate(lista, 1):
+            quando = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            print(f"  {i}. {p.name}  ({quando})")
+        while True:
+            s = ask("Numero del backup da ripristinare (invio per annullare): ")
+            if not s:
+                return
+            if s.isascii() and s.isdigit() and 1 <= int(s) <= len(lista):
+                break
+            print("Scelta non valida.")
+        nuovo, errore = leggi_database(lista[int(s) - 1])
+        if errore:
+            print(errore)
+            return
+        self.sostituisci_database(nuovo, lista[int(s) - 1].name)
+
+    @solo_admin
+    def esporta_database(self):
+        print("Attenzione: il file contiene anche gli hash delle password: conservalo con cura.")
+        predefinito = percorso_libero(cartella_esportazioni(), f"fantamusica_export_{datetime.now():%Y%m%d-%H%M%S}.json")
+        s = ask(f"File di destinazione [{predefinito}] (invio = quello indicato): ")
+        percorso = Path(s).expanduser() if s else predefinito
+        if percorso.exists() and not ask_si(f"{percorso} esiste già: sovrascrivere?"):
+            print("Annullato.")
+            return
+        try:
+            scrivi_json(self.db, percorso)
+        except OSError as e:
+            print(f"Impossibile scrivere il file: {e.strerror or e}")
+            return
+        print(f"Database esportato in {percorso}")
+
+    @solo_admin
+    def importa_database(self):
+        s = ask("File da importare (invio per annullare): ")
+        if not s:
+            return
+        percorso = Path(s).expanduser()
+        nuovo, errore = leggi_database(percorso)
+        if errore:
+            print(errore)
+            return
+        self.sostituisci_database(nuovo, percorso.name)
+
+    @solo_admin
+    def esporta_csv_menu(self):
+        predefinita = cartella_esportazioni()
+        s = ask(f"Cartella di destinazione [{predefinita}] (invio = quella indicata): ")
+        cartella = Path(s).expanduser() if s else predefinita
+        try:
+            scritti = esporta_csv(self.db, cartella)
+        except OSError as e:
+            print(f"Impossibile scrivere i file: {e.strerror or e}")
+            return
+        print("Creati (separatore ';', si aprono con Excel):")
+        for p in scritti:
+            print(f"  {p}")
+
+    @solo_admin
     def chiudi_stagione(self):
         db = self.db
         s = db["impostazioni"]
@@ -2682,6 +2871,7 @@ class Gioco:
         if ask("Scrivi CHIUDI per confermare: ") != "CHIUDI":
             print("Annullato.")
             return
+        print(f"Backup prima della chiusura: {crea_backup(db, 'chiusura-stagione')}")
         cl = classifica_giocatori(db)
         dati_m = sorted(((m, punti_musicista(db, m["id"])) for m in db["musicisti"]),
                         key=lambda x: (-x[1], x[0]["nome"].lower()))

@@ -24,11 +24,11 @@ I salvataggi di versioni precedenti vengono aggiornati automaticamente all'apert
 
 | | Admin | Partecipante |
 |---|---|---|
-| Classifiche, statistiche, storico stagioni, profili | ✅ | ✅ |
+| Classifiche (con tutte le informazioni e caratteristiche di giocatori e musicisti), statistiche, storico stagioni | ✅ | ✅ |
 | La mia squadra, mercato e scambi | se gioca | ✅ |
 | Impostazioni della stagione | modifica | sola lettura |
 | Preferenze personali (soprannomi, ordinamenti, password...) | ✅ | ✅ |
-| Asta, musicisti, azioni, bonus, eventi, utenti, chiusura stagione | ✅ | ❌ |
+| Asta, musicisti, azioni, bonus, eventi, utenti, backup ed esportazione, chiusura stagione | ✅ | ❌ |
 
 ## Come funziona il punteggio
 
@@ -44,7 +44,7 @@ Alla creazione di un'azione l'admin sceglie come si calcolano i punti:
 
 **Più musicisti**: un'azione può prevedere dei ruoli (es. *Protagonista* e *Ospite*), ciascuno con il
 proprio punteggio, definiti alla creazione. Quando si registra l'evento si possono aggiungere altri
-musicisti coinvolti con un punteggio libero.
+musicisti coinvolti con un punteggio libero (come punteggio base: anche a loro si applicano i bonus/malus scelti).
 
 **Bonus e malus**: hanno un valore fissato alla creazione, scritto come `+5` / `-3` (punti interi) o
 `20%` / `-10%` (percentuale), e si collegano a una o più azioni. Registrando l'evento il programma
@@ -75,6 +75,21 @@ musicisti, azioni e bonus. Dallo storico si consultano le stagioni passate e la 
   vede solo sul proprio account.
 - Elenchi ordinabili per colonna: l'ordinamento scelto viene ricordato per ogni giocatore.
 - Recupero password con domanda segreta.
+
+## Backup ed esportazione
+
+Dal pannello admin, *Backup ed esportazione*:
+
+- **Backup**: copie datate del database nella cartella `backup/`, create anche in automatico
+  prima di ogni chiusura stagione e prima di ogni ripristino/importazione.
+- **Ripristina da un backup** o **importa da un file**: sostituiscono tutti i dati (con conferma
+  esplicita e backup di sicurezza dello stato attuale). L'operazione è rifiutata se l'admin che la
+  esegue non esistesse più nel database scelto.
+- **Esporta tutto il database** in un file JSON (contiene gli hash delle password: conservalo con cura).
+- **Esporta in CSV** classifica giocatori, classifica musicisti ed eventi, nella cartella
+  `esportazioni/` (separatore `;`, si aprono direttamente con Excel).
+
+Le cartelle `backup/` e `esportazioni/` sono escluse da Git.
 
 ## Test
 

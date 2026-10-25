@@ -2,7 +2,9 @@
 fantamusica_dati.json
 fantamusica_dati.tmp
 *.bak
- 
+backup/
+esportazioni/
+
 # Python
 __pycache__/
 *.pyc
