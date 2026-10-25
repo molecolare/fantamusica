@@ -7,20 +7,27 @@ Come si gioca
   1. A inizio stagione i partecipanti comprano i musicisti all'asta (con i crediti).
   2. Durante la stagione l'admin registra le azioni dei musicisti (nuovo singolo,
      disco d'oro, scandalo...): i punti vanno a chi ha scelto quel musicista.
-  3. Tutti possono consultare classifica e statistiche.
+  3. Tutti possono consultare classifica, statistiche e profili.
+
+Profili
+  L'admin definisce delle "caratteristiche" (es. Strumento, Anni di carriera) per i
+  musicisti e per i giocatori e le compila: tutti possono poi consultare i profili.
 
 Ruoli
-  - admin:        permessi globali (asta, musicisti, azioni, eventi, utenti, impostazioni)
-  - partecipante: consulta classifica, statistiche, la propria squadra, le impostazioni
-                  (sola lettura) e cambia la propria password
+  - admin:        permessi globali (asta, musicisti, azioni, eventi, utenti, profili,
+                  impostazioni)
+  - partecipante: consulta classifica, statistiche, profili, la propria squadra, le
+                  impostazioni (sola lettura) e cambia la propria password
 
 Avvio:  python3 fantamusica.py
 I dati sono salvati in fantamusica_dati.json (accanto allo script).
+I salvataggi delle versioni precedenti vengono aggiornati in automatico all'apertura.
 """
 import functools
 import getpass
 import hashlib
 import json
+import math
 import os
 import secrets
 from datetime import datetime
@@ -43,24 +50,59 @@ AZIONI_BASE = [
     ("Concerto annullato", -10),
 ]
 
+# Caratteristiche di partenza dei profili (l'admin può rinominarle, eliminarle o aggiungerne)
+CAMPI_BASE = [
+    ("musicisti", "Strumento", "testo"),
+    ("musicisti", "Genere musicale", "testo"),
+    ("musicisti", "Anni di carriera", "numero"),
+    ("giocatori", "Soprannome", "testo"),
+]
+
 
 # --------------------------------------------------------------------------
 # Dati
 # --------------------------------------------------------------------------
 def nuovo_db():
-    return {
+    db = {
         "impostazioni": {
             "stagione": "Stagione 1",
             "musicisti_per_squadra": 5,
             "budget_iniziale": 500,
             "rilancio_minimo": 1,
         },
-        "utenti": [],      # {nome, ruolo, salt, hash, gioca}
-        "musicisti": [],   # {id, nome, proprietario, prezzo}
+        "utenti": [],      # {nome, ruolo, salt, hash, gioca, profilo}
+        "musicisti": [],   # {id, nome, proprietario, prezzo, profilo}
         "azioni": [{"id": i + 1, "nome": n, "punti": p} for i, (n, p) in enumerate(AZIONI_BASE)],
-        "eventi": [],      # {id, data, musicista_id, azione, punti, proprietario, nota}
-        "contatori": {"musicista": 1, "azione": len(AZIONI_BASE) + 1, "evento": 1},
+        "eventi": [],      # {id, data, musicista_id, azione_id, azione, punti, proprietario, nota}
+        "contatori": {"musicista": 1, "azione": len(AZIONI_BASE) + 1, "evento": 1, "campo": 1},
     }
+    # migra() crea "campi" ({id, per: "musicisti"|"giocatori", nome, tipo: "testo"|"numero"})
+    # con le caratteristiche di partenza
+    migra(db)
+    return db
+
+
+def migra(db):
+    """Porta un salvataggio di una versione precedente al formato attuale.
+    Restituisce True se ha cambiato qualcosa."""
+    cambiato = False
+    if "campi" not in db:
+        db["campi"] = []
+        db["contatori"].setdefault("campo", 1)
+        for per, nome, tipo in CAMPI_BASE:
+            db["campi"].append({"id": prossimo_id(db, "campo"), "per": per, "nome": nome, "tipo": tipo})
+        cambiato = True
+    for elemento in db["utenti"] + db["musicisti"]:
+        if "profilo" not in elemento:
+            elemento["profilo"] = {}
+            cambiato = True
+    # Gli eventi ora puntano all'azione per ID (così rinominarla aggiorna anche lo storico)
+    per_nome = {a["nome"].lower(): a["id"] for a in db["azioni"]}
+    for e in db["eventi"]:
+        if "azione_id" not in e:
+            e["azione_id"] = per_nome.get(e["azione"].lower())
+            cambiato = True
+    return cambiato
 
 
 def carica():
@@ -119,7 +161,7 @@ def nuova_password():
 
 def crea_utente(db, nome, password, ruolo="partecipante"):
     salt, h = hash_password(password)
-    u = {"nome": nome, "ruolo": ruolo, "salt": salt, "hash": h, "gioca": True}
+    u = {"nome": nome, "ruolo": ruolo, "salt": salt, "hash": h, "gioca": True, "profilo": {}}
     db["utenti"].append(u)
     return u
 
@@ -180,6 +222,35 @@ def classifica_giocatori(db):
                   key=lambda x: (-x[1], x[0].lower()))
     pos = posizioni([p for _, p in dati])
     return [(ps, n, p) for ps, (n, p) in zip(pos, dati)]
+
+
+def campi_per(db, per):
+    """Caratteristiche definite per 'musicisti' o 'giocatori'."""
+    return [c for c in db["campi"] if c["per"] == per]
+
+
+def profili_di(db, per):
+    """Gli elementi che hanno un profilo: i musicisti, oppure gli utenti."""
+    return db["musicisti"] if per == "musicisti" else db["utenti"]
+
+
+def parse_numero(testo):
+    """Numero intero o decimale (accetta anche la virgola); None se non valido."""
+    try:
+        v = float(testo.replace(",", "."))
+    except ValueError:
+        return None
+    if not math.isfinite(v):
+        return None
+    return int(v) if v.is_integer() else v
+
+
+def fmt_valore(v):
+    return "-" if v is None or v == "" else str(v)
+
+
+def valore_profilo(elemento, campo):
+    return fmt_valore(elemento.get("profilo", {}).get(str(campo["id"])))
 
 
 # --------------------------------------------------------------------------
@@ -259,7 +330,7 @@ class Gioco:
             s = ask("> ")
             if s == "0":
                 return
-            if s.isdigit() and 1 <= int(s) <= len(voci):
+            if s.isascii() and s.isdigit() and 1 <= int(s) <= len(voci):
                 voci[int(s) - 1][1]()
                 self.salva()
             else:
@@ -271,6 +342,7 @@ class Gioco:
             ("Classifica", self.menu_classifica),
             ("Statistiche", self.menu_statistiche),
             ("La mia squadra", lambda: self.dettaglio_squadra(self.me["nome"])),
+            ("Profili (musicisti e giocatori)", self.menu_profili),
             ("Impostazioni", self.impostazioni),
             ("Cambia la mia password", self.cambia_password),
         ]
@@ -283,7 +355,7 @@ class Gioco:
             s = ask(prompt)
             if not s:
                 return None
-            if s.isdigit():
+            if s.isascii() and s.isdigit():
                 for x in lista:
                     if x["id"] == int(s):
                         return x
@@ -454,6 +526,55 @@ class Gioco:
         print("\nUltimi 15 eventi")
         self.tabella_eventi(list(reversed(ev[-15:])))
 
+    # ---------- profili (consultazione, per tutti) ----------
+    def menu_profili(self):
+        self.menu("Profili", [("Profilo di un musicista", self.profilo_musicista),
+                              ("Profilo di un giocatore", self.profilo_giocatore)])
+
+    def stampa_caratteristiche(self, elemento, per):
+        campi = campi_per(self.db, per)
+        if not campi:
+            print("(nessuna caratteristica definita)")
+            return
+        larg = max(len(c["nome"]) for c in campi) + 1
+        for c in campi:
+            print(f"  {c['nome'] + ':':<{larg}} {valore_profilo(elemento, c)}")
+
+    def profilo_musicista(self):
+        db = self.db
+        if not db["musicisti"]:
+            print("Nessun musicista.")
+            return
+        self.tabella_musicisti()
+        m = self.scegli_per_id(db["musicisti"], "ID musicista (invio per tornare indietro): ")
+        if not m:
+            return
+        tot = sum(e["punti"] for e in db["eventi"])
+        p = punti_musicista(db, m["id"])
+        print(f"\n=== {m['nome']} ===")
+        if m["proprietario"]:
+            print(f"  Squadra: {m['proprietario']} (pagato {m['prezzo']} crediti)")
+        else:
+            print("  Squadra: nessuna (libero)")
+        print(f"  Punti:   {p:+d} ({pct(p, tot)} dei punti totali)")
+        self.stampa_caratteristiche(m, "musicisti")
+        recenti = [e for e in db["eventi"] if e["musicista_id"] == m["id"]][-5:]
+        if recenti:
+            print("\nUltimi eventi")
+            self.tabella_eventi(list(reversed(recenti)))
+
+    def profilo_giocatore(self):
+        db = self.db
+        s = ask("Nome giocatore (invio = il tuo profilo): ")
+        u = utente(db, s) if s else self.me
+        if not u:
+            print("Giocatore non trovato.")
+            return
+        print(f"\n=== {u['nome']} ===")
+        self.stampa_caratteristiche(u, "giocatori")
+        if u["gioca"]:
+            self.dettaglio_squadra(u["nome"])
+
     # ---------- impostazioni ----------
     def impostazioni(self):
         s = self.db["impostazioni"]
@@ -516,6 +637,7 @@ class Gioco:
             ("Gestione musicisti", self.menu_musicisti),
             ("Gestione azioni", self.menu_azioni),
             ("Gestione utenti", self.menu_utenti),
+            ("Caratteristiche dei profili", self.menu_campi),
             ("Elimina un evento", self.elimina_evento),
             ("Azzera stagione", self.azzera_stagione),
         ])
@@ -553,6 +675,7 @@ class Gioco:
             "id": prossimo_id(db, "evento"),
             "data": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "musicista_id": m["id"],
+            "azione_id": a["id"],
             "azione": a["nome"],
             "punti": punti,
             "proprietario": m["proprietario"],
@@ -644,6 +767,7 @@ class Gioco:
         self.menu("Musicisti", [
             ("Elenco", self.elenco_musicisti),
             ("Aggiungi musicisti", self.aggiungi_musicisti),
+            ("Modifica un musicista (nome, prezzo, caratteristiche)", self.modifica_musicista),
             ("Rimuovi un musicista", self.rimuovi_musicista),
             ("Svincola un musicista (torna libero, rimborso)", self.svincola_musicista),
         ])
@@ -667,7 +791,66 @@ class Gioco:
                 print("Già presente.")
                 continue
             db["musicisti"].append({"id": prossimo_id(db, "musicista"), "nome": nome,
-                                    "proprietario": None, "prezzo": 0})
+                                    "proprietario": None, "prezzo": 0, "profilo": {}})
+
+    @solo_admin
+    def chiedi_valori_profilo(self, elemento, per):
+        """Compila le caratteristiche di un profilo: invio = invariato, '-' = cancella."""
+        campi = campi_per(self.db, per)
+        if not campi:
+            print("Nessuna caratteristica definita: creale da Pannello admin > Caratteristiche dei profili.")
+            return
+        profilo = elemento.setdefault("profilo", {})
+        print("Caratteristiche (invio = lascia com'è, - = cancella il valore):")
+        for c in campi:
+            chiave = str(c["id"])
+            while True:
+                s = ask(f"  {c['nome']} ({c['tipo']}) [{valore_profilo(elemento, c)}]: ")
+                if not s:
+                    break
+                if s == "-":
+                    profilo.pop(chiave, None)
+                    break
+                if c["tipo"] == "numero":
+                    v = parse_numero(s)
+                    if v is None:
+                        print("  Serve un numero (es. 12 oppure 3,5).")
+                        continue
+                    profilo[chiave] = v
+                else:
+                    profilo[chiave] = s
+                break
+
+    @solo_admin
+    def modifica_musicista(self):
+        db = self.db
+        if not db["musicisti"]:
+            print("Nessun musicista.")
+            return
+        self.tabella_musicisti()
+        m = self.scegli_per_id(db["musicisti"], "ID musicista da modificare (invio per annullare): ")
+        if not m:
+            return
+        print(f"\nModifica di {m['nome']} (invio = lascia com'è)")
+        nome = ask(f"Nome [{m['nome']}]: ")
+        if nome and nome != m["nome"]:
+            if any(x is not m and x["nome"].lower() == nome.lower() for x in db["musicisti"]):
+                print("Esiste già un musicista con questo nome: nome lasciato invariato.")
+            else:
+                m["nome"] = nome
+        if m["proprietario"]:
+            s = ask(f"Prezzo pagato da {m['proprietario']} [{m['prezzo']}]: ")
+            if s:
+                nuovo = int(s) if s.isascii() and s.isdigit() else 0
+                if nuovo < 1:
+                    print("Il prezzo deve essere un intero di almeno 1: prezzo lasciato invariato.")
+                elif nuovo - m["prezzo"] > crediti(db, m["proprietario"]):
+                    print(f"{m['proprietario']} non ha crediti sufficienti "
+                          f"({crediti(db, m['proprietario'])} disponibili): prezzo lasciato invariato.")
+                else:
+                    m["prezzo"] = nuovo
+        self.chiedi_valori_profilo(m, "musicisti")
+        print(f"{m['nome']} aggiornato.")
 
     @solo_admin
     def rimuovi_musicista(self):
@@ -720,25 +903,58 @@ class Gioco:
         nome = ask("Nome azione: ")
         if not nome:
             return
+        if any(x["nome"].lower() == nome.lower() for x in db["azioni"]):
+            print("Esiste già un'azione con questo nome.")
+            return
         db["azioni"].append({"id": prossimo_id(db, "azione"), "nome": nome,
                              "punti": ask_int("Punti (anche negativi): ")})
 
     @solo_admin
     def modifica_azione(self):
+        db = self.db
         self.elenco_azioni()
-        a = self.scegli_per_id(self.db["azioni"], "ID azione da modificare (invio per annullare): ")
+        a = self.scegli_per_id(db["azioni"], "ID azione da modificare (invio per annullare): ")
         if not a:
             return
+        eventi = [e for e in db["eventi"] if e.get("azione_id") == a["id"]]
+        print(f"\nModifica di '{a['nome']}' - usata in {len(eventi)} eventi (invio = lascia com'è)")
+
         nome = ask(f"Nome [{a['nome']}]: ")
-        if nome:
-            a["nome"] = nome
+        if nome and nome != a["nome"]:
+            if any(x is not a and x["nome"].lower() == nome.lower() for x in db["azioni"]):
+                print("Esiste già un'azione con questo nome: nome lasciato invariato.")
+            else:
+                a["nome"] = nome
+                for e in eventi:
+                    e["azione"] = nome  # anche lo storico mostra il nome corretto
+                if eventi:
+                    print(f"Nome aggiornato anche nei {len(eventi)} eventi già registrati.")
+
         p = ask(f"Punti [{a['punti']:+d}]: ")
         if p:
             try:
-                a["punti"] = int(p)
+                nuovi = int(p)
             except ValueError:
                 print("Punti non validi, lasciati invariati.")
-        print("Gli eventi già registrati non cambiano.")
+                return
+            vecchi = a["punti"]
+            a["punti"] = nuovi
+            if nuovi == vecchi:
+                return
+            da_aggiornare = [e for e in eventi if e["punti"] == vecchi]
+            if da_aggiornare:
+                print(f"{len(da_aggiornare)} eventi già registrati hanno il vecchio punteggio ({vecchi:+d}).")
+                if len(eventi) > len(da_aggiornare):
+                    print(f"Altri {len(eventi) - len(da_aggiornare)} hanno un punteggio personalizzato "
+                          f"e non verrebbero toccati.")
+                if ask(f"Portarli a {nuovi:+d}? Le classifiche cambieranno. (s/N) ").lower() == "s":
+                    for e in da_aggiornare:
+                        e["punti"] = nuovi
+                    print("Eventi aggiornati.")
+                else:
+                    print("Eventi lasciati invariati: il nuovo punteggio vale dai prossimi.")
+            else:
+                print("Il nuovo punteggio vale dai prossimi eventi.")
 
     @solo_admin
     def elimina_azione(self):
@@ -753,6 +969,7 @@ class Gioco:
         self.menu("Utenti", [
             ("Elenco", self.elenco_utenti),
             ("Aggiungi utente", self.aggiungi_utente),
+            ("Modifica profilo giocatore (caratteristiche)", self.modifica_profilo_giocatore),
             ("Reimposta password", self.reset_password),
             ("Promuovi / retrocedi admin", self.cambia_ruolo),
             ("Partecipa / non partecipa alla classifica", self.cambia_gioca),
@@ -791,6 +1008,94 @@ class Gioco:
         ruolo = "admin" if ask("Admin? (s/N) ").lower() == "s" else "partecipante"
         crea_utente(db, nome, pw, ruolo)
         print(f"Utente {nome} creato ({ruolo}).")
+
+    @solo_admin
+    def modifica_profilo_giocatore(self):
+        u = self.chiedi_utente()
+        if u:
+            print(f"\nProfilo di {u['nome']}")
+            self.chiedi_valori_profilo(u, "giocatori")
+
+    # ----- caratteristiche dei profili -----
+    @solo_admin
+    def menu_campi(self):
+        self.menu("Caratteristiche dei profili", [
+            ("Elenco", self.elenco_campi),
+            ("Aggiungi una caratteristica", self.aggiungi_campo),
+            ("Rinomina una caratteristica", self.rinomina_campo),
+            ("Elimina una caratteristica", self.elimina_campo),
+        ])
+
+    @solo_admin
+    def elenco_campi(self):
+        db = self.db
+        if not db["campi"]:
+            print("Nessuna caratteristica definita.")
+            return
+        righe = []
+        for c in db["campi"]:
+            profili = profili_di(db, c["per"])
+            compilati = sum(1 for p in profili if str(c["id"]) in p.get("profilo", {}))
+            righe.append((c["id"], c["per"], c["nome"], c["tipo"],
+                          f"{compilati}/{len(profili)} ({pct(compilati, len(profili))})"))
+        tabella(["ID", "Per", "Caratteristica", "Tipo", "Compilata"], righe, "><<<<")
+        print("I valori si inseriscono da Gestione musicisti > Modifica e da Gestione utenti > Modifica profilo.")
+
+    @solo_admin
+    def aggiungi_campo(self):
+        db = self.db
+        s = ask("Per chi? 1 = musicisti, 2 = giocatori (invio per annullare): ")
+        if not s:
+            return
+        per = {"1": "musicisti", "2": "giocatori"}.get(s)
+        if not per:
+            print("Scelta non valida.")
+            return
+        nome = ask("Nome della caratteristica (es. Strumento): ")
+        if not nome:
+            return
+        if any(c["per"] == per and c["nome"].lower() == nome.lower() for c in db["campi"]):
+            print("Esiste già una caratteristica con questo nome.")
+            return
+        t = ask("Tipo: 1 = testo, 2 = numero [1]: ")
+        if t not in ("", "1", "2"):
+            print("Scelta non valida.")
+            return
+        db["campi"].append({"id": prossimo_id(db, "campo"), "per": per, "nome": nome,
+                            "tipo": "numero" if t == "2" else "testo"})
+        print(f"Aggiunta '{nome}' ai profili dei {per}: ora puoi compilarla.")
+
+    @solo_admin
+    def rinomina_campo(self):
+        db = self.db
+        self.elenco_campi()
+        c = self.scegli_per_id(db["campi"], "ID caratteristica da rinominare (invio per annullare): ")
+        if not c:
+            return
+        nome = ask(f"Nuovo nome [{c['nome']}]: ")
+        if not nome or nome == c["nome"]:
+            return
+        if any(x is not c and x["per"] == c["per"] and x["nome"].lower() == nome.lower() for x in db["campi"]):
+            print("Esiste già una caratteristica con questo nome.")
+            return
+        c["nome"] = nome
+        print("Rinominata: i valori già inseriti restano.")
+
+    @solo_admin
+    def elimina_campo(self):
+        db = self.db
+        self.elenco_campi()
+        c = self.scegli_per_id(db["campi"], "ID caratteristica da eliminare (invio per annullare): ")
+        if not c:
+            return
+        profili = profili_di(db, c["per"])
+        compilati = [p for p in profili if str(c["id"]) in p.get("profilo", {})]
+        if ask(f"Eliminare '{c['nome']}'? Verranno cancellati i valori inseriti in {len(compilati)} profili. (s/N) ").lower() != "s":
+            return
+        for p in compilati:
+            del p["profilo"][str(c["id"])]
+        db["campi"].remove(c)
+        print("Caratteristica eliminata.")
 
     @solo_admin
     def reset_password(self):
@@ -894,6 +1199,8 @@ def main():
     db = carica()
     if db is None:
         db = setup_iniziale()
+    elif migra(db):
+        salva(db)  # salvataggio di una versione precedente: aggiornato al formato attuale
     print("=== FANTAMUSICA ===")
     u = login(db)
     if u:
