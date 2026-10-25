@@ -1,115 +1,136 @@
-# FantaBanda 🎸
+# FantaMusica online
 
-Un fantasy game dei musicisti da giocare con gli amici, in Python, direttamente dal terminale.
-Nessuna dipendenza: basta Python 3.10 o superiore.
+Il gioco di sempre, ma raggiungibile da qualsiasi browser (PC, telefono, tablet).
+Si apre una pagina con un **terminale** identico a quello che usavi sul computer: stessi menu, stessi comandi.
+I dati sono in un database condiviso (Supabase), così tutti i giocatori vedono le stesse cose.
 
-All'inizio della stagione ogni partecipante compra i suoi musicisti all'asta. Durante la stagione
-l'admin registra le **azioni** dei musicisti (un nuovo singolo, un disco d'oro, uno scandalo...) e i
-punti vanno a chi ha scelto quel musicista. Vince chi chiude la stagione in testa alla classifica.
-
-## Avvio
-
-```bash
-python3 fantamusica.py
+```
+Browser  ──►  Render (server.py + fantamusica.py)  ──►  Supabase (database Postgres)
 ```
 
-Al primo avvio si crea l'account admin. I dati vengono salvati in `fantamusica_dati.json`
-accanto allo script (puoi cambiarne il percorso con la variabile d'ambiente `FANTAMUSICA_DATA`).
-I salvataggi di versioni precedenti vengono aggiornati automaticamente all'apertura.
+- **GitHub**: contiene il codice. Render lo scarica da lì a ogni aggiornamento.
+- **Render**: esegue il programma e gli dà un indirizzo web (`https://fantamusica-xxxx.onrender.com`).
+- **Supabase**: conserva i dati in modo permanente. Il disco di Render si cancella a ogni riavvio, quindi senza Supabase perderesti tutto.
 
-> **Attenzione:** `fantamusica_dati.json` contiene utenti e password (sotto forma di hash): è già
-> escluso da Git tramite `.gitignore`, non pubblicarlo.
+Costo: 0 €. Con 6 giocatori sei largamente dentro i limiti gratuiti.
 
-## Ruoli
+---
 
-| | Admin | Partecipante |
-|---|---|---|
-| Classifiche (con tutte le informazioni e caratteristiche di giocatori e musicisti), statistiche, storico stagioni | ✅ | ✅ |
-| La mia squadra, mercato e scambi | se gioca | ✅ |
-| Impostazioni della stagione | modifica | sola lettura |
-| Preferenze personali (soprannomi, ordinamenti, password...) | ✅ | ✅ |
-| Asta, musicisti, azioni, bonus, eventi, utenti, backup ed esportazione, chiusura stagione | ✅ | ❌ |
+## 1. Supabase (il database) — circa 5 minuti
 
-## Come funziona il punteggio
+1. Vai su <https://supabase.com>, crea un account e poi **New project**.
+   - Nome a piacere (es. `fantamusica`), scegli una **password del database** e **segnatela** (usa solo lettere e numeri, evita simboli come `@ : / # ?`: complicano la stringa di connessione).
+   - Regione: una europea (es. Frankfurt o Paris).
+2. Quando il progetto è pronto clicca **Connect** (in alto) e scegli **Session pooler**.
+   Copia la stringa, che assomiglia a:
+   `postgresql://postgres.abcdefgh:[YOUR-PASSWORD]@aws-0-eu-central-1.pooler.supabase.com:5432/postgres`
+3. Sostituisci `[YOUR-PASSWORD]` con la tua password del database. Questa è la tua **DATABASE_URL**: tienila a portata di mano e non pubblicarla mai.
 
-Alla creazione di un'azione l'admin sceglie come si calcolano i punti:
+> Usa proprio il *Session pooler*: la "Direct connection" funziona solo su IPv6 e da Render non si collega.
 
-- **Fisso**: sempre lo stesso punteggio (anche negativo).
-- **Sondaggio**: il valore si decide dopo un sondaggio, in un range a scelta nel formato `1-10`.
-  Si inserisce subito oppure l'evento resta in **pending** e si completa più tardi. Si possono
-  raccogliere più voti anche in momenti diversi: vale la **media arrotondata per difetto**
-  (una media tra 0 e 1 vale comunque 1 punto).
-- **A quantità**: si chiede una quantità e si moltiplica per i punti di ogni unità. L'unità di
-  misura è libera (minuti, ore, giorni, km, ascolti...).
+Non devi creare tabelle: il programma le crea da solo al primo avvio (in uno schema privato, con la sicurezza a livello di riga attiva, perché dentro ci sono gli hash delle password).
 
-**Più musicisti**: un'azione può prevedere dei ruoli (es. *Protagonista* e *Ospite*), ciascuno con il
-proprio punteggio, definiti alla creazione. Quando si registra l'evento si possono aggiungere altri
-musicisti coinvolti con un punteggio libero (come punteggio base: anche a loro si applicano i bonus/malus scelti).
+## 2. GitHub (il codice) — circa 5 minuti
 
-**Bonus e malus**: hanno un valore fissato alla creazione, scritto come `+5` / `-3` (punti interi) o
-`20%` / `-10%` (percentuale), e si collegano a una o più azioni. Registrando l'evento il programma
-chiede quali applicare. Ordine di calcolo: prima si sommano i punti interi alla base, poi si
-applicano le percentuali (sommate tra loro) al totale ottenuto, arrotondando per difetto, cioè
-verso il basso anche per i numeri negativi.
+1. Crea un account su <https://github.com> e poi **New repository**. Nome `fantamusica`, imposta **Private** (consigliato), non aggiungere README/gitignore.
+2. Carica i file di questa cartella. Il modo più semplice senza usare il terminale: nella pagina del repository clicca **uploading an existing file** e trascina dentro **tutti** i file e la cartella `static` (devono restare `static/index.html`, `server.py`, `fantamusica.py`, `requirements.txt`, `render.yaml`, `.gitignore`, `migra_su_database.py`, `README.md`). Poi **Commit changes**.
 
-Esempio: base 10, bonus `+5` e `+20%` → 10 + 5 = 15, poi +20% di 15 = +3 → **18**.
+   Oppure da terminale, dentro la cartella:
+   ```bash
+   git init
+   git add .
+   git commit -m "FantaMusica online"
+   git branch -M main
+   git remote add origin https://github.com/TUO-UTENTE/fantamusica.git
+   git push -u origin main
+   ```
+3. Controlla che **non** sia stato caricato `fantamusica_dati.json` (i dati e le password): il file `.gitignore` serve proprio a evitarlo.
 
-**DITTATURA**: l'admin può inserire un evento con il punteggio deciso a mano, senza sondaggi né bonus.
+## 3. Render (il sito) — circa 10 minuti
 
-## Mercato
+1. Su <https://render.com> crea un account e accedi con GitHub.
+2. **New → Web Service**, scegli il repository `fantamusica` (la prima volta Render ti chiede di autorizzare l'accesso).
+3. Compila:
+   | Campo | Valore |
+   |---|---|
+   | Language / Runtime | `Python 3` |
+   | Branch | `main` |
+   | Build Command | `pip install -r requirements.txt` |
+   | Start Command | `gunicorn -k gthread -w 1 --threads 32 --timeout 120 -b 0.0.0.0:$PORT server:app` |
+   | Instance Type | **Free** |
+4. In **Environment Variables** aggiungi:
+   | Nome | Valore |
+   |---|---|
+   | `DATABASE_URL` | la stringa di Supabase del punto 1 |
+   | `FANTAMUSICA_SETUP_CODE` | un codice a tua scelta (serve solo al primo avvio, vedi sotto) |
+   | `PYTHON_VERSION` | `3.12.7` |
+   | `TZ` | `Europe/Rome` (così gli orari degli eventi sono quelli italiani) |
+5. **Create Web Service**. Dopo qualche minuto in alto compare l'indirizzo `https://….onrender.com`.
 
-I giocatori si propongono scambi o vendite di musicisti, con eventuale conguaglio in crediti. Ogni
-musicista porta con sé il prezzo d'asta e i punti già maturati restano alla squadra che li ha
-ottenuti. Il numero di scambi per giocatore a stagione è nelle impostazioni (default 3) e l'admin
-può aprire e chiudere il mercato.
+(In alternativa a 3 e 4 c'è `render.yaml`: **New → Blueprint** e Render compila tutto da solo, ti chiede solo i due valori segreti.)
 
-## Stagioni
+## 4. Primo avvio
 
-*Chiudi stagione* archivia classifiche ed eventi nello storico e riparte da zero, tenendo utenti,
-musicisti, azioni e bonus. Dallo storico si consultano le stagioni passate e la classifica cumulativa.
+**Apri tu l'indirizzo per primo.** La prima persona che entra crea l'account admin: per questo il programma chiede il *codice di installazione* (`FANTAMUSICA_SETUP_CODE`), così uno sconosciuto che trovasse il link non può prendersi il gioco.
 
-## Personalizzazione
+1. Scrivi il codice, poi nome e password dell'admin.
+2. Accedi → **PANNELLO ADMIN → Gestione utenti → Aggiungi utente** per ogni giocatore (max 6).
+3. Manda a ciascuno l'indirizzo, il suo nome utente e la password iniziale. Dopo l'accesso possono cambiarla e impostare il recupero password da *Impostazioni*.
+4. Da qui in poi è come sempre: musicisti, asta, eventi…
 
-- Caratteristiche dei profili (strumento, genere, anni di carriera, città...) definite dall'admin.
-- Soprannome per ogni musicista (impostato dall'admin) e soprannomi personali che ogni giocatore
-  vede solo sul proprio account.
-- Elenchi ordinabili per colonna: l'ordinamento scelto viene ricordato per ogni giocatore.
-- Recupero password con domanda segreta.
+### Se hai già dati sul computer
+Prima di aprire il sito, dal tuo computer (serve Python):
+```bash
+pip install "psycopg[binary]"
+export DATABASE_URL="postgresql://...la stringa di Supabase..."     # Windows (cmd): set DATABASE_URL=...
+python3 migra_su_database.py fantamusica_dati.json
+```
+Poi apri il sito e accedi con i tuoi utenti di sempre (in quel caso il codice di installazione non serve).
 
-## Backup ed esportazione
+---
 
-Dal pannello admin, *Backup ed esportazione*:
+## Come si usa dal browser
 
-- **Backup**: copie datate del database nella cartella `backup/`, create anche in automatico
-  prima di ogni chiusura stagione e prima di ogni ripristino/importazione.
-- **Ripristina da un backup** o **importa da un file**: sostituiscono tutti i dati (con conferma
-  esplicita e backup di sicurezza dello stato attuale). L'operazione è rifiutata se l'admin che la
-  esegue non esistesse più nel database scelto.
-- **Esporta tutto il database** in un file JSON (contiene gli hash delle password: conservalo con cura).
-- **Esporta in CSV** classifica giocatori, classifica musicisti ed eventi, nella cartella
-  `esportazioni/` (separatore `;`, si aprono direttamente con Excel).
+- Sul **computer** scrivi direttamente nel terminale. Le password non compaiono mentre le scrivi (come sempre).
+- Da **telefono** tocca il terminale per la tastiera, oppure usa la barra in basso ("Invia"): è più comoda per i testi lunghi. Quando il programma chiede una password la barra nasconde i caratteri.
+- Dopo 30 minuti senza digitare la sessione si chiude: ricarica la pagina (o premi *Riconnetti*) e rientra.
 
-Le cartelle `backup/` e `esportazioni/` sono escluse da Git.
+## Cosa cambia rispetto alla versione da terminale
 
-## Test
+- **Più persone insieme**: prima di ogni scelta di menu i dati vengono riletti dal database, quindi vedi subito le mosse degli altri (nuove proposte di scambio, eventi, ecc.).
+- **Modifiche nello stesso istante**: se due persone salvano nello stesso momento, la seconda vede "ATTENZIONE… NON è stata salvata" e deve ripetere l'operazione. Nulla viene sovrascritto di nascosto. All'asta l'aggiudicazione si ricontrolla e si riprova da sola.
+- **Backup**: "Backup ed esportazione → Crea un backup" li salva nel database (ne restano 50). Il ripristino funziona come prima. L'esportazione su file e il CSV non sono disponibili online (il disco del server non è permanente): per scaricare i dati puoi usare il *Table editor* di Supabase (schema `fantamusica`).
+- Prima di **chiudere la stagione** viene creato un backup automatico, come prima.
+
+## Limiti dei piani gratuiti (verificati il 25/10/2026)
+
+- **Render free**: il servizio si "addormenta" dopo 15 minuti senza traffico e la prima apertura successiva richiede circa un minuto. Ha 750 ore al mese (un servizio sempre acceso ne usa al massimo 744). Il disco è effimero (per questo i dati stanno su Supabase). Quando Render si riavvia o addormenta, le sessioni aperte si chiudono: basta ricaricare la pagina, i dati non si perdono.
+- **Supabase free**: 500 MB di database (questo gioco ne usa pochi KB) e il progetto viene **messo in pausa dopo 1 settimana di inattività**. Se non lo usate per più di una settimana, dal pannello Supabase premi *Restore project* e riparte con i dati intatti.
+
+Fonti: [Render – Deploy for Free](https://render.com/docs/free), [Supabase – Pricing](https://supabase.com/pricing.md), [Supabase – IPv4 e IPv6](https://supabase.com/docs/guides/troubleshooting/supabase--your-network-ipv4-and-ipv6-compatibility-cHe3BP).
+
+## Sicurezza (consigli)
+
+- Tieni il repository **privato** e non scrivere mai la `DATABASE_URL` nei file: va solo nelle variabili d'ambiente di Render.
+- Il programma accetta password da 4 caratteri: fate password più lunghe, visto che il sito è raggiungibile da chiunque conosca l'indirizzo. Dopo 3 password errate la sessione si chiude e dallo stesso indirizzo internet si possono aprire al massimo 20 sessioni ogni 10 minuti.
+- Se perdi il controllo dell'admin, dal *Table editor* di Supabase puoi comunque intervenire sui dati.
+
+## Aggiornare il gioco
+
+Modifica i file su GitHub (o `git push`): Render si riavvia da solo con la nuova versione. I dati restano su Supabase.
+
+## Provarlo sul proprio computer
 
 ```bash
-python3 -m unittest -v test_fantamusica
+pip install -r requirements.txt
+python3 server.py            # poi apri http://localhost:8000
 ```
+Senza `DATABASE_URL` i dati vanno nel file `fantamusica_dati.json` come sempre; con `DATABASE_URL` impostata usi il database online.
+`server.py` funziona su Linux e macOS (su Windows serve WSL); non serve per giocare online, perché lì ci pensa Render.
+`python3 fantamusica.py` continua a funzionare direttamente da terminale.
 
-I test usano un file temporaneo e non toccano i dati reali.
+## Se qualcosa non va
 
-## Pubblicare su GitHub
-
-```bash
-git init
-git add .
-git commit -m "FantaBanda: prima versione"
-git branch -M main
-git remote add origin https://github.com/<tuo-utente>/<nome-repo>.git
-git push -u origin main
-```
-
-## Licenza
-
-MIT, vedi [LICENSE](LICENSE).
+- Pagina bianca / "Riconnetti" subito: guarda i **Logs** del servizio su Render.
+- Errore di connessione al database: ricontrolla `DATABASE_URL` (password giusta, stringa del *Session pooler*, nessuna parentesi quadra rimasta).
+- Dopo una settimana ferma: il progetto Supabase è in pausa, riattivalo dal pannello.

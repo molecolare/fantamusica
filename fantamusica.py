@@ -47,11 +47,22 @@ Ruoli
                   e gestisce le proprie preferenze personali (soprannome, riepilogo
                   all'accesso, recupero password...)
 
-Avvio:  python3 fantamusica.py
+Avvio in locale:  python3 fantamusica.py
 I dati sono salvati in fantamusica_dati.json (accanto allo script). Il pannello admin ha
 "Backup ed esportazione": backup datati (cartella backup/, anche in automatico a ogni chiusura
 stagione), ripristino, esportazione/importazione dell'intero database e CSV di classifiche ed eventi.
 I salvataggi delle versioni precedenti vengono aggiornati in automatico all'apertura.
+
+Versione online (Render + Supabase)
+  Se e' impostata la variabile d'ambiente DATABASE_URL (stringa di connessione Postgres di
+  Supabase) i dati NON stanno piu' nel file ma nel database, condivisi fra tutti i giocatori
+  collegati. In questa modalita':
+  - prima di ogni azione i dati vengono riletti dal database (si vedono le mosse degli altri);
+  - se due persone modificano nello stesso momento, la seconda operazione NON viene salvata
+    e il programma lo dice (basta ripeterla);
+  - i backup stanno in una tabella del database (si conservano gli ultimi 50);
+  - esportazione/importazione su file non sono disponibili (il disco del server e' effimero).
+  server.py mostra il programma in un terminale nel browser (vedi README.md).
 """
 import copy
 import functools
@@ -62,12 +73,16 @@ import json
 import math
 import os
 import secrets
+import time
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 
 DATA_FILE = Path(os.environ.get("FANTAMUSICA_DATA")
                  or Path(__file__).with_name("fantamusica_dati.json"))
+# Se presente, i dati stanno in un database Postgres condiviso invece che nel file
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+BACKUP_CONSERVATI = 50
 
 # Azioni di partenza (l'admin può modificarle dal pannello)
 AZIONI_BASE = [
@@ -258,7 +273,74 @@ def migra(db):
     return cambiato
 
 
+# --------------------------------------------------------------------------
+# Salvataggio: file locale oppure database Postgres (Supabase) condiviso
+# --------------------------------------------------------------------------
+def usa_database():
+    return bool(DATABASE_URL)
+
+
+# Le tabelle stanno in uno schema privato (non esposto dall'API pubblica di Supabase) e hanno
+# la sicurezza a livello di riga attiva: contengono gli hash delle password.
+SCHEMA_SQL = (
+    "CREATE SCHEMA IF NOT EXISTS fantamusica",
+    """CREATE TABLE IF NOT EXISTS fantamusica.dati (
+           id int PRIMARY KEY,
+           dati json NOT NULL,
+           versione bigint NOT NULL DEFAULT 1,
+           aggiornato timestamptz NOT NULL DEFAULT now())""",
+    """CREATE TABLE IF NOT EXISTS fantamusica.backup (
+           id bigserial PRIMARY KEY,
+           nome text NOT NULL,
+           creato timestamptz NOT NULL DEFAULT now(),
+           dati json NOT NULL)""",
+    "ALTER TABLE fantamusica.dati ENABLE ROW LEVEL SECURITY",
+    "ALTER TABLE fantamusica.backup ENABLE ROW LEVEL SECURITY",
+)
+
+# versione: numero di versione letto dal database (serve a scoprire se qualcun altro ha salvato nel
+# frattempo); foto: contenuto al momento della lettura (per non riscrivere se non e' cambiato nulla).
+_stato = {"versione": None, "foto": None, "pronto": False}
+
+
+def _foto(db):
+    return json.dumps(db, sort_keys=True, ensure_ascii=False)
+
+
+def _db_esegui(operazione):
+    """Esegue operazione(connessione) con una connessione nuova; riprova se la rete ha un intoppo."""
+    import psycopg
+    ultimo = None
+    for tentativo in range(3):
+        try:
+            with psycopg.connect(DATABASE_URL, prepare_threshold=None, connect_timeout=10,
+                                 autocommit=True) as conn:
+                if not _stato["pronto"]:
+                    for q in SCHEMA_SQL:
+                        conn.execute(q)
+                    _stato["pronto"] = True
+                return operazione(conn)
+        except psycopg.Error as e:
+            ultimo = e
+            time.sleep(1 + tentativo)
+    raise ultimo
+
+
+def _json(dati):
+    from psycopg.types.json import Json
+    return Json(dati, dumps=lambda o: json.dumps(o, ensure_ascii=False))
+
+
 def carica():
+    if usa_database():
+        riga = _db_esegui(lambda c: c.execute(
+            "SELECT dati, versione FROM fantamusica.dati WHERE id = 1").fetchone())
+        if not riga:
+            _stato["versione"] = None
+            return None
+        db, _stato["versione"] = riga
+        _stato["foto"] = _foto(db)
+        return db
     if DATA_FILE.exists():
         with open(DATA_FILE, encoding="utf-8") as f:
             return json.load(f)
@@ -266,10 +348,45 @@ def carica():
 
 
 def salva(db):
+    """Salva i dati. Ritorna True se salvati (o se non c'era nulla da salvare); False se, nel database
+    condiviso, qualcun altro ha salvato nel frattempo (in quel caso non scrive nulla)."""
+    if usa_database():
+        foto = _foto(db)
+        if foto == _stato["foto"] and _stato["versione"] is not None:
+            return True
+        dati = _json(db)
+
+        def scrivi(conn):
+            if _stato["versione"] is None:
+                return conn.execute(
+                    "INSERT INTO fantamusica.dati (id, dati, versione) VALUES (1, %s, 1) "
+                    "ON CONFLICT (id) DO NOTHING RETURNING versione", (dati,)).fetchone()
+            return conn.execute(
+                "UPDATE fantamusica.dati SET dati = %s, versione = versione + 1, aggiornato = now() "
+                "WHERE id = 1 AND versione = %s RETURNING versione", (dati, _stato["versione"])).fetchone()
+        riga = _db_esegui(scrivi)
+        if not riga:
+            return False
+        _stato["versione"], _stato["foto"] = riga[0], foto
+        return True
     tmp = DATA_FILE.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
     os.replace(tmp, DATA_FILE)
+    return True
+
+
+def ricarica(db):
+    """Rilegge i dati condivisi dal database e li mette nello stesso oggetto 'db' (gli altri giocatori
+    possono averli cambiati). Senza database non fa nulla."""
+    if not usa_database():
+        return
+    nuovo = carica()
+    if nuovo is None:
+        return
+    migra(nuovo)
+    db.clear()
+    db.update(nuovo)
 
 
 def prossimo_id(db, tipo):
@@ -492,9 +609,6 @@ def parse_range(testo):
     return (lo, hi) if lo < hi else None
 
 
-
-
-
 def calcola_punti(base, bonus):
     """Punteggio finale: base + bonus/malus a punti interi; poi le percentuali (sommate) si applicano
     a questo totale, arrotondando per difetto (verso il basso, anche se negativo)."""
@@ -643,9 +757,20 @@ def classifica_cumulativa(db, includi_corrente=True):
     return [(p, n, d) for p, (n, d) in zip(pos, righe)]
 
 
-# ----- recupero password -----
 # ----- backup ed esportazione -----
 CHIAVI_OBBLIGATORIE = ("impostazioni", "utenti", "musicisti", "azioni", "eventi", "contatori")
+
+
+class BackupDB:
+    """Un backup salvato nella tabella del database (versione online)."""
+
+    def __init__(self, id_, nome, quando):
+        self.id, self.name, self.quando = id_, nome, quando
+
+    def leggi(self):
+        riga = _db_esegui(lambda c: c.execute(
+            "SELECT dati FROM fantamusica.backup WHERE id = %s", (self.id,)).fetchone())
+        return riga[0] if riga else None
 
 
 def cartella_backup():
@@ -674,28 +799,55 @@ def scrivi_json(db, percorso):
 
 
 def crea_backup(db, motivo="manuale"):
-    """Copia datata del database nella cartella 'backup' accanto ai dati. Ritorna il percorso."""
+    """Copia datata del database. In locale: file nella cartella 'backup' (ritorna il percorso);
+    online: riga nella tabella dei backup (ritorna una descrizione)."""
+    if usa_database():
+        nome = f"{motivo}_{datetime.now():%Y%m%d-%H%M%S}"
+        dati = _json(db)
+
+        def scrivi(conn):
+            conn.execute("INSERT INTO fantamusica.backup (nome, dati) VALUES (%s, %s)", (nome, dati))
+            conn.execute("DELETE FROM fantamusica.backup WHERE id NOT IN "
+                         "(SELECT id FROM fantamusica.backup ORDER BY id DESC LIMIT %s)", (BACKUP_CONSERVATI,))
+        _db_esegui(scrivi)
+        return f"'{nome}' (salvato nel database)"
     nome = f"{DATA_FILE.stem}_{motivo}_{datetime.now():%Y%m%d-%H%M%S}.json"
     return scrivi_json(db, percorso_libero(cartella_backup(), nome))
 
 
 def elenco_backup():
     """I backup esistenti, dal piu' recente."""
+    if usa_database():
+        righe = _db_esegui(lambda c: c.execute(
+            "SELECT id, nome, creato FROM fantamusica.backup ORDER BY id DESC").fetchall())
+        return [BackupDB(i, n, c.astimezone().strftime("%Y-%m-%d %H:%M")) for i, n, c in righe]
     cart = cartella_backup()
     if not cart.is_dir():
         return []
     return sorted(cart.glob(f"{DATA_FILE.stem}_*.json"), key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
 
 
-def leggi_database(percorso):
-    """Legge e controlla un file di database. Ritorna (db migrato, errore o None)."""
-    try:
-        with open(percorso, encoding="utf-8") as f:
-            dati = json.load(f)
-    except OSError as e:
-        return None, f"Impossibile leggere il file: {e.strerror or e}"
-    except ValueError:
-        return None, "Il file non è un JSON valido."
+def quando_backup(p):
+    if isinstance(p, BackupDB):
+        return p.quando
+    return datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+
+
+def leggi_database(origine):
+    """Legge e controlla un file (o un backup del database). Ritorna (db migrato, errore o None)."""
+    if isinstance(origine, BackupDB):
+        try:
+            dati = origine.leggi()
+        except Exception:
+            return None, "Impossibile leggere il backup dal database."
+    else:
+        try:
+            with open(origine, encoding="utf-8") as f:
+                dati = json.load(f)
+        except OSError as e:
+            return None, f"Impossibile leggere il file: {e.strerror or e}"
+        except ValueError:
+            return None, "Il file non è un JSON valido."
     if not isinstance(dati, dict) or any(not isinstance(dati.get(k), (dict, list)) for k in CHIAVI_OBBLIGATORIE):
         return None, "Il file non sembra un database di FantaBanda."
     try:
@@ -753,6 +905,7 @@ def esporta_csv(db, cartella):
     return scritti
 
 
+# ----- recupero password -----
 def normalizza_risposta(s):
     return " ".join(s.lower().split())
 
@@ -768,9 +921,18 @@ def recupero_password(db):
     for _ in range(3):
         _, h = hash_password(normalizza_risposta(ask("Risposta: ")), r["salt"])
         if secrets.compare_digest(h, r["hash"]):
-            u["salt"], u["hash"] = hash_password(nuova_password())
-            salva(db)
-            print("Password aggiornata: ora puoi accedere.")
+            nuova = nuova_password()
+            ricarica(db)  # dati freschi prima di scrivere
+            u = utente(db, nome)
+            if not u:
+                print("Utente non trovato.")
+                return
+            u["salt"], u["hash"] = hash_password(nuova)
+            if salva(db):
+                print("Password aggiornata: ora puoi accedere.")
+            else:
+                print("Non è stato possibile salvare (qualcuno ha modificato i dati nello stesso momento): "
+                      "riprova.")
             return
         print("Risposta errata.")
     print("Troppi tentativi.")
@@ -885,8 +1047,36 @@ class Gioco:
         self.db = db
         self.me = me
 
-    def salva(self):
-        salva(self.db)
+    def aggiorna(self):
+        """Versione online: rilegge i dati dal database (gli altri giocatori possono averli cambiati)
+        e riaggancia il proprio utente."""
+        if not usa_database():
+            return
+        ricarica(self.db)
+        me = utente(self.db, self.me["nome"])
+        if me is None:
+            print("Il tuo utente non esiste più.")
+            raise SystemExit(0)
+        self.me = me
+
+    def salva(self, avvisa=True):
+        """Ritorna True se salvato. Se un altro giocatore ha salvato nel frattempo l'ultima operazione
+        non viene scritta: si ricaricano i dati e (se avvisa) si avvisa."""
+        if salva(self.db):
+            return True
+        if avvisa:
+            print("\nATTENZIONE: un altro giocatore ha modificato i dati mentre eri in questa schermata:\n"
+                  "l'ultima operazione NON è stata salvata. Controlla la situazione aggiornata e ripetila.")
+        self.aggiorna()
+        return False
+
+    def solo_su_file(self):
+        """Funzioni che scrivono file sul disco: non disponibili nella versione online."""
+        if usa_database():
+            print("Non disponibile nella versione online (il disco del server non è permanente): "
+                  "i dati stanno nel database e i backup si fanno da 'Crea un backup ora'.")
+            return True
+        return False
 
     # ---------- menu ----------
     def menu(self, titolo, voci, indietro="Indietro"):
@@ -899,12 +1089,14 @@ class Gioco:
             if s == "0":
                 return
             if s.isascii() and s.isdigit() and 1 <= int(s) <= len(voci):
+                self.aggiorna()
                 voci[int(s) - 1][1]()
                 self.salva()
             else:
                 print("Scelta non valida.")
 
     def avvia(self):
+        self.aggiorna()
         p = prefs(self.me)
         print(f"\nBenvenuto, {p['soprannome'] or self.me['nome']}! (ruolo: {self.me['ruolo']})")
         self.riepilogo_accesso()
@@ -1423,7 +1615,6 @@ class Gioco:
     def soprannomi_musicisti(self):
         """Ogni giocatore puo' dare un soprannome ai musicisti, visibile solo a lui (accanto a quello ufficiale)."""
         db = self.db
-        mio = prefs(self.me)["soprannomi_musicisti"]
         if not db["musicisti"]:
             print("Nessun musicista.")
             return
@@ -1432,6 +1623,7 @@ class Gioco:
                                    self.mostra_musicisti)
             if not m:
                 return
+            mio = prefs(self.me)["soprannomi_musicisti"]  # riletto ogni volta: i dati possono essere stati ricaricati
             s = ask(f"Il tuo soprannome per {m['nome']} [{mio.get(str(m['id'])) or '-'}] "
                     f"(max 30 caratteri, - per toglierlo, invio = invariato): ")
             if s == "-":
@@ -1441,8 +1633,8 @@ class Gioco:
             self.salva()
 
     def preferenze(self):
-        p = prefs(self.me)
         while True:
+            p = prefs(self.me)  # riletto ogni volta: i dati possono essere stati ricaricati
             print("\n=== Preferenze personali (salvate nel tuo profilo, valgono a ogni accesso) ===")
             print(f"  1. Soprannome (nel saluto e in classifica): {p['soprannome'] or '-'}")
             print(f"  2. Riepilogo all'accesso:                   {'sì' if p['riepilogo_login'] else 'no'}")
@@ -1473,8 +1665,8 @@ class Gioco:
             self.salva()
 
     def impostazioni_stagione(self):
-        s = self.db["impostazioni"]
         while True:
+            s = self.db["impostazioni"]  # riletto ogni volta: i dati possono essere stati ricaricati
             print("\n=== Impostazioni della stagione ===")
             print(f"  1. Nome stagione:             {s['stagione']}")
             print(f"  2. Musicisti per squadra:     {s['musicisti_per_squadra']}")
@@ -1788,7 +1980,13 @@ class Gioco:
                                lambda: self.mostra_eventi(eventi_recenti(db, prefs(self.me)["righe_eventi"])))
         if not e:
             return
+        eid = e["id"]
         while True:
+            # riletto ogni volta: se il salvataggio e' andato in conflitto i dati sono stati ricaricati
+            e = next((x for x in db["eventi"] if x["id"] == eid), None)
+            if e is None:
+                print("L'evento non esiste più.")
+                return
             print("\nEvento selezionato:")
             self.mostra_eventi([e], "evento_singolo")
             if e.get("gruppo"):
@@ -1897,12 +2095,33 @@ class Gioco:
         tabella(["Giocatore", "Crediti", "Posti liberi"],
                 [(u["nome"], crediti(db, u["nome"]), n_max - len(rosa(db, u["nome"]))) for u in giocatori(db)], "<>>")
 
+    def aggiudica(self, mid, vincitore, prezzo):
+        """Assegna il musicista al vincitore dell'asta. Un'asta puo' durare a lungo e nel frattempo gli altri
+        giocatori possono aver cambiato i dati (scambi, crediti): si rileggono e si ricontrolla tutto prima di
+        scrivere, riprovando da soli se qualcuno salva proprio in quel momento.
+        Ritorna (esito, messaggio) con esito 'fatto', 'annullata' o 'riprova'."""
+        db = self.db
+        for _ in range(3):
+            self.aggiorna()
+            m = next((x for x in db["musicisti"] if x["id"] == mid), None)
+            if not m or m["proprietario"]:
+                return "annullata", "Il musicista non è più disponibile: asta annullata."
+            u = utente(db, vincitore)
+            posti = db["impostazioni"]["musicisti_per_squadra"] - len(rosa(db, vincitore)) if u else 0
+            if not u or posti <= 0 or prezzo > crediti(db, vincitore) - (posti - 1):
+                return "annullata", (f"Nel frattempo la situazione di {vincitore} è cambiata e l'offerta non è "
+                                     f"più valida: asta annullata.")
+            m["proprietario"], m["prezzo"] = vincitore, prezzo
+            if self.salva(avvisa=False):
+                return "fatto", f"AGGIUDICATO: {m['nome']} a {vincitore} per {prezzo} crediti."
+        return "riprova", "Altri giocatori stanno salvando in questo momento: riscrivi 'ok' per riprovare."
+
     @solo_admin
     def asta(self):
         db = self.db
-        s = db["impostazioni"]
-        n_max = s["musicisti_per_squadra"]
         while True:
+            s = db["impostazioni"]
+            n_max = s["musicisti_per_squadra"]
             liberi = [m for m in db["musicisti"] if not m["proprietario"]]
             if not liberi:
                 print("Nessun musicista disponibile all'asta.")
@@ -1914,6 +2133,7 @@ class Gioco:
             m = self.scegli_per_id(liberi, "ID musicista da mettere all'asta (invio per uscire): ", elenco)
             if not m:
                 return
+            mid = m["id"]
             print(f"\nASTA: {m['nome']} - base 1 credito, rilancio minimo {s['rilancio_minimo']}")
             print("Comandi: 'nome importo' = offerta | ok = aggiudica | annulla | stato = crediti")
             vincitore, miglior = None, 0
@@ -1930,9 +2150,10 @@ class Gioco:
                     if not vincitore:
                         print("Nessuna offerta registrata.")
                         continue
-                    m["proprietario"], m["prezzo"] = vincitore, miglior
-                    self.salva()
-                    print(f"AGGIUDICATO: {m['nome']} a {vincitore} per {miglior} crediti.")
+                    esito, messaggio = self.aggiudica(mid, vincitore, miglior)
+                    print(messaggio)
+                    if esito == "riprova":
+                        continue  # le offerte restano: basta riscrivere 'ok'
                     break
                 parti = cmd.rsplit(" ", 1)
                 if len(parti) != 2 or not (parti[1].isascii() and parti[1].isdigit()):
@@ -2790,7 +3011,8 @@ class Gioco:
         db.clear()
         db.update(nuovo)
         self.me = utente(db, self.me["nome"])
-        self.salva()
+        if not self.salva():
+            return False
         print("Database sostituito.")
         return True
 
@@ -2801,8 +3023,7 @@ class Gioco:
             print("Nessun backup trovato.")
             return
         for i, p in enumerate(lista, 1):
-            quando = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            print(f"  {i}. {p.name}  ({quando})")
+            print(f"  {i}. {p.name}  ({quando_backup(p)})")
         while True:
             s = ask("Numero del backup da ripristinare (invio per annullare): ")
             if not s:
@@ -2818,6 +3039,8 @@ class Gioco:
 
     @solo_admin
     def esporta_database(self):
+        if self.solo_su_file():
+            return
         print("Attenzione: il file contiene anche gli hash delle password: conservalo con cura.")
         predefinito = percorso_libero(cartella_esportazioni(), f"fantamusica_export_{datetime.now():%Y%m%d-%H%M%S}.json")
         s = ask(f"File di destinazione [{predefinito}] (invio = quello indicato): ")
@@ -2834,6 +3057,8 @@ class Gioco:
 
     @solo_admin
     def importa_database(self):
+        if self.solo_su_file():
+            return
         s = ask("File da importare (invio per annullare): ")
         if not s:
             return
@@ -2846,6 +3071,8 @@ class Gioco:
 
     @solo_admin
     def esporta_csv_menu(self):
+        if self.solo_su_file():
+            return
         predefinita = cartella_esportazioni()
         s = ask(f"Cartella di destinazione [{predefinita}] (invio = quella indicata): ")
         cartella = Path(s).expanduser() if s else predefinita
@@ -2903,12 +3130,18 @@ class Gioco:
 # --------------------------------------------------------------------------
 def setup_iniziale():
     print("Primo avvio: creazione dell'account amministratore.")
+    codice = os.environ.get("FANTAMUSICA_SETUP_CODE")
+    if codice and not secrets.compare_digest(leggi_password("Codice di installazione: "), codice):
+        print("Codice errato.")
+        raise SystemExit(0)
     nome = ""
     while not nome:
         nome = ask("Nome admin: ")
     db = nuovo_db()
     crea_utente(db, nome, nuova_password(), "admin")
-    salva(db)
+    if not salva(db):
+        print("La configurazione iniziale è già stata completata da qualcun altro: riapri la pagina.")
+        raise SystemExit(0)
     print("Admin creato. Dal pannello admin puoi aggiungere utenti e musicisti e fare l'asta.")
     return db
 
@@ -2923,6 +3156,7 @@ def login(db):
             recupero_password(db)
             continue
         pw = leggi_password("Password: ")
+        ricarica(db)  # utenti e password aggiornati (online: li gestisce l'admin mentre altri sono collegati)
         u = utente(db, nome)
         if u and verifica_password(u, pw):
             return u

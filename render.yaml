@@ -1,0 +1,21 @@
+# Blueprint di Render: crea il servizio web gratuito leggendo questo file dal repository GitHub.
+services:
+  - type: web
+    name: fantamusica
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # Un solo worker con molti thread: ogni giocatore collegato occupa un thread
+    startCommand: gunicorn -k gthread -w 1 --threads 32 --timeout 120 -b 0.0.0.0:$PORT server:app
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: TZ
+        value: Europe/Rome
+      # Stringa di connessione di Supabase (Session pooler): la inserisci tu nel pannello di Render
+      - key: DATABASE_URL
+        sync: false
+      # Codice richiesto la prima volta per creare l'admin (evita che lo faccia uno sconosciuto)
+      - key: FANTAMUSICA_SETUP_CODE
+        sync: false

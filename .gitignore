@@ -1,14 +1,13 @@
-# Dati di gioco (contengono utenti e hash delle password: non vanno pubblicati)
+# Dati di gioco e password (hash): NON vanno mai su GitHub
 fantamusica_dati.json
 fantamusica_dati.tmp
-*.bak
+fantamusica_kivy.py
 backup/
 esportazioni/
+.env
+*.env
 
-# Python
 __pycache__/
 *.pyc
 .venv/
-.idea/
-.vscode/
- 
+venv/

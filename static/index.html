@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, interactive-widget=resizes-content">
+<title>FantaMusica</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+<style>
+  html, body { height: 100%; margin: 0; background: #14121c; }
+  body { display: flex; flex-direction: column; font-family: system-ui, sans-serif; color: #e8e6f0; }
+  header { padding: 8px 14px; font-size: 14px; display: flex; justify-content: space-between;
+           align-items: center; background: #1d1a2b; border-bottom: 1px solid #2d2942; }
+  header b { letter-spacing: .5px; }
+  #stato { opacity: .7; font-size: 12px; }
+  #term { flex: 1; min-height: 0; padding: 6px 8px; }
+  #riconnetti { display: none; margin-left: 10px; padding: 4px 10px; border-radius: 6px; border: 0;
+                background: #7c5cff; color: #fff; font-size: 12px; cursor: pointer; }
+  #barra { display: flex; gap: 6px; padding: 6px 8px; background: #1d1a2b; border-top: 1px solid #2d2942; }
+  #barra input { flex: 1; min-width: 0; font-size: 16px; padding: 8px 10px; border-radius: 6px;
+                 border: 1px solid #3a3556; background: #14121c; color: #e8e6f0; }
+  #barra button { font-size: 14px; padding: 8px 14px; border: 0; border-radius: 6px;
+                  background: #7c5cff; color: #fff; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <span><b>FANTAMUSICA</b></span>
+  <span><span id="stato">connessione...</span><button id="riconnetti">Riconnetti</button></span>
+</header>
+<div id="term"></div>
+<form id="barra" autocomplete="off">
+  <input id="riga" type="text" placeholder="Scrivi qui e premi Invio (comodo da telefono)"
+         autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send">
+  <button type="submit">Invia</button>
+</form>
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script>
+(function () {
+  var term = new Terminal({ cursorBlink: true, fontSize: 14, convertEol: false,
+                            fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
+                            theme: { background: '#14121c' } });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('term'));
+
+  var stato = document.getElementById('stato');
+  var bottone = document.getElementById('riconnetti');
+  var ws = null;
+
+  function dimensioni() {
+    fit.fit();
+    if (ws && ws.readyState === 1) {
+      ws.send('\x00' + JSON.stringify({ c: term.cols, r: term.rows }));
+    }
+  }
+
+  function collega() {
+    term.reset();
+    stato.textContent = 'connessione...';
+    bottone.style.display = 'none';
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    ws = new WebSocket(proto + location.host + '/ws');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function () { stato.textContent = 'connesso'; dimensioni(); term.focus(); };
+    ws.onmessage = function (ev) {
+      term.write(typeof ev.data === 'string' ? ev.data : new Uint8Array(ev.data), segui_prompt);
+    };
+    ws.onclose = function () {
+      stato.textContent = 'disconnesso';
+      bottone.style.display = 'inline-block';
+      term.write('\r\n\x1b[2m[Sessione terminata. Premi "Riconnetti" per rientrare.]\x1b[0m\r\n');
+    };
+  }
+
+  // Se il programma sta chiedendo una password, la barra di scrittura nasconde i caratteri.
+  function segui_prompt() {
+    var b = term.buffer.active;
+    var riga = b.getLine(b.baseY + b.cursorY);
+    var testo = riga ? riga.translateToString(true) : '';
+    document.getElementById('riga').type = /password|codice di installazione/i.test(testo) ? 'password' : 'text';
+  }
+
+  term.onData(function (d) { if (ws && ws.readyState === 1) ws.send(d); });
+  window.addEventListener('resize', dimensioni);
+  bottone.onclick = collega;
+
+  // Barra di scrittura: comoda da telefono. Le password vanno scritte nel terminale (non compaiono),
+  // qui il testo e' visibile.
+  document.getElementById('barra').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var campo = document.getElementById('riga');
+    if (ws && ws.readyState === 1) { ws.send(campo.value + '\r'); }
+    campo.value = '';
+  });
+
+  collega();
+})();
+</script>
+</body>
+</html>
