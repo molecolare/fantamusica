@@ -1,9 +1,12 @@
-.venv
-__pycache__
-
-*.pyc
-
-
+# Dati di gioco (contengono utenti e hash delle password: non vanno pubblicati)
 fantamusica_dati.json
-test_fantamusica.py
-kivy_test.py
+fantamusica_dati.tmp
+*.bak
+ 
+# Python
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+ 

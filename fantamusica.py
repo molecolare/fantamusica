@@ -20,11 +20,13 @@ Come si calcolano i punti di un'azione (scelto alla creazione dell'azione)
   sul pending): il valore usato e' la media dei voti, arrotondata per difetto (una media
   tra 0 e 1 vale comunque 1 punto).
   Bonus/malus: ognuno ha un valore fissato alla creazione, scritto come "+5"/"-3" (punti
-  interi) oppure "20%"/"-10%" (percentuale del punteggio base, arrotondata per difetto
-  all'intero). Si collegano a una o piu' azioni; registrando l'evento il programma chiede
-  quali applicare e li somma al punteggio.
-  Un'azione puo' coinvolgere piu' musicisti, ciascuno con il proprio ruolo e il proprio
-  punteggio: tutto si definisce alla creazione dell'azione.
+  interi) oppure "20%"/"-10%" (percentuale). Si collegano a una o piu' azioni; registrando
+  l'evento il programma chiede quali applicare. Ordine di calcolo: prima si sommano i punti
+  interi alla base, poi si applicano le percentuali (sommate fra loro) al totale cosi' ottenuto,
+  con arrotondamento per difetto (verso il basso, anche per i negativi).
+  Un'azione puo' prevedere piu' musicisti, ciascuno con il proprio ruolo e punteggio
+  (definiti alla creazione); alla registrazione si possono aggiungere altri musicisti
+  coinvolti con un punteggio libero.
   DITTATURA: l'admin puo' inserire un evento con il punteggio deciso a mano.
 
 Mercato
@@ -57,6 +59,7 @@ import math
 import os
 import secrets
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 
 DATA_FILE = Path(os.environ.get("FANTAMUSICA_DATA")
@@ -94,6 +97,7 @@ SCAMBI_PREDEFINITI = 3
 # Preferenze personali di ogni giocatore (salvate nel suo profilo e caricate al login)
 PREF_BASE = {
     "soprannome": "",          # mostrato nel saluto e nella classifica
+    "soprannomi_musicisti": {},  # soprannomi personali dei musicisti: {id musicista: soprannome}
     "riepilogo_login": True,   # riepilogo all'accesso (posizione, novità, pending)
     "righe_eventi": 15,        # quanti eventi mostrare negli elenchi (0 = tutti)
     "ordinamenti": {},         # ultimo ordinamento scelto per ogni elenco: {lista: [colonna, decrescente]}
@@ -182,6 +186,7 @@ def migra(db):
         prefs(u)
     for m in db["musicisti"]:
         imposta(m, "profilo", {})
+        imposta(m, "soprannome", "")
     # Bonus: ora hanno un tipo (punti|percentuale) e un valore fissi. Nelle versioni precedenti
     # la formula si sceglieva per ogni collegamento: si prende quella del primo collegamento.
     tipo_da_link = {}
@@ -483,17 +488,15 @@ def parse_range(testo):
     return (lo, hi) if lo < hi else None
 
 
-def punti_bonus(base, b):
-    """Punti (interi) che il bonus/malus aggiunge a una base: la percentuale e' calcolata sulla
-    base e arrotondata per difetto (verso zero) all'intero."""
-    if b["tipo"] == "punti":
-        return int(b["valore"])
-    return int(base * b["valore"] / 100)
+
 
 
 def calcola_punti(base, bonus):
-    """Punteggio finale: la base piu' (o meno) i punti di ogni bonus/malus applicato."""
-    return int(base) + sum(punti_bonus(base, b) for b in bonus)
+    """Punteggio finale: base + bonus/malus a punti interi; poi le percentuali (sommate) si applicano
+    a questo totale, arrotondando per difetto (verso il basso, anche se negativo)."""
+    totale = int(base) + sum(int(b["valore"]) for b in bonus if b["tipo"] == "punti")
+    perc = sum(Fraction(str(b["valore"])) for b in bonus if b["tipo"] == "percentuale")
+    return totale + math.floor(totale * perc / 100)
 
 
 def parse_voti(testo, lo, hi):
@@ -935,10 +938,18 @@ class Gioco:
                 for c in campi_per(self.db, per)]
 
     # ---------- colonne e tabelle dei vari elenchi ----------
+    def col_soprannome(self):
+        return Col("soprannome", "Soprannome", lambda m: m.get("soprannome") or None)
+
+    def col_mio_soprannome(self):
+        return Col("mio_sopr", "Il tuo soprannome",
+                   lambda m: prefs(self.me)["soprannomi_musicisti"].get(str(m["id"])) or None)
+
     def colonne_musicisti(self, campi=False):
         db = self.db
         cols = [Col("id", "ID", lambda m: m["id"], ">"),
                 Col("nome", "Musicista", lambda m: m["nome"]),
+                self.col_soprannome(), self.col_mio_soprannome(),
                 Col("squadra", "Squadra", lambda m: m["proprietario"]),
                 Col("prezzo", "Prezzo", lambda m: m["prezzo"] if m["proprietario"] else None, ">"),
                 Col("punti", "Punti", lambda m: punti_musicista(db, m["id"]), ">")]
@@ -1240,6 +1251,7 @@ class Gioco:
             return
         tot = sum(e["punti"] for e in eventi_ok(db))
         cols = [Col("nome", "Musicista", lambda m: m["nome"]),
+                self.col_soprannome(), self.col_mio_soprannome(),
                 Col("squadra", "Squadra", lambda m: m["proprietario"]),
                 Col("prezzo", "Prezzo", lambda m: m["prezzo"] if m["proprietario"] else None, ">"),
                 Col("punti", "Punti", lambda m: punti_musicista(db, m["id"]), ">"),
@@ -1322,6 +1334,26 @@ class Gioco:
         self.menu("Impostazioni", [("Preferenze personali", self.preferenze),
                                    ("Impostazioni della stagione", self.impostazioni_stagione)])
 
+    def soprannomi_musicisti(self):
+        """Ogni giocatore puo' dare un soprannome ai musicisti, visibile solo a lui (accanto a quello ufficiale)."""
+        db = self.db
+        mio = prefs(self.me)["soprannomi_musicisti"]
+        if not db["musicisti"]:
+            print("Nessun musicista.")
+            return
+        while True:
+            m = self.scegli_per_id(db["musicisti"], "ID musicista a cui dare un soprannome (invio per finire): ",
+                                   self.mostra_musicisti)
+            if not m:
+                return
+            s = ask(f"Il tuo soprannome per {m['nome']} [{mio.get(str(m['id'])) or '-'}] "
+                    f"(max 30 caratteri, - per toglierlo, invio = invariato): ")
+            if s == "-":
+                mio.pop(str(m["id"]), None)
+            elif s:
+                mio[str(m["id"])] = s[:30]
+            self.salva()
+
     def preferenze(self):
         p = prefs(self.me)
         while True:
@@ -1331,6 +1363,7 @@ class Gioco:
             print(f"  3. Eventi mostrati negli elenchi:           {p['righe_eventi'] or 'tutti'}")
             print(f"  4. Recupero password:                       "
                   f"{'impostato' if self.me.get('recupero') else 'non impostato'}")
+            print(f"  5. Soprannomi personali dei musicisti:      {len(p['soprannomi_musicisti'])} impostati")
             s = ask("Numero da modificare (0 = indietro): ")
             if s in ("", "0"):
                 return
@@ -1346,6 +1379,8 @@ class Gioco:
                 p["righe_eventi"] = ask_int("Quanti eventi mostrare (0 = tutti): ", 0)
             elif s == "4":
                 self.imposta_recupero()
+            elif s == "5":
+                self.soprannomi_musicisti()
             else:
                 print("Scelta non valida.")
                 continue
@@ -1432,8 +1467,9 @@ class Gioco:
 
     # ----- registrazione eventi -----
     def scegli_musicisti_azione(self):
-        """Sceglie l'azione e un musicista per ogni ruolo previsto dall'azione (definiti alla sua
-        creazione). Ritorna ([(musicista, ruolo)], azione) oppure (None, None)."""
+        """Sceglie l'azione, un musicista per ogni ruolo previsto dall'azione (definiti alla sua
+        creazione) ed eventuali altri coinvolti (ruolo None: punteggio libero).
+        Ritorna ([(musicista, ruolo o None)], azione) oppure (None, None)."""
         db = self.db
         if not db["musicisti"] or not db["azioni"]:
             print("Servono almeno un musicista e un'azione.")
@@ -1456,6 +1492,21 @@ class Gioco:
             if not m:
                 return None, None
             scelti.append((m, s))
+        # eventuali altri coinvolti, con punteggio libero da vincoli
+        liberi = [m for m in db["musicisti"] if m["id"] not in [x["id"] for x, _ in scelti]]
+        if liberi and ask_si("C'è qualcun altro coinvolto?"):
+            validi = {m["id"] for m in liberi}
+            while True:
+                self.mostra_musicisti(liberi)
+                r = ask("ID degli altri musicisti coinvolti (separati da virgola; invio = nessuno): ")
+                if not r:
+                    break
+                ids = parse_ids(r, validi, ordina=False)
+                if not ids:
+                    print("ID non validi.")
+                    continue
+                scelti += [(m, None) for i in ids for m in liberi if m["id"] == i]
+                break
         return scelti, a
 
     def chiedi_base(self, a, s, ctx, chi):
@@ -1526,6 +1577,13 @@ class Gioco:
         db["eventi"].append(e)
         return e
 
+    def ruolo_evento(self, a, s):
+        """Ruolo da scrivere nell'evento: quello dell'azione se ne prevede piu' di uno, 'extra' per i
+        musicisti aggiunti alla registrazione."""
+        if s is None:
+            return "extra"
+        return s["ruolo"] if len(slot_azione(a)) > 1 else ""
+
     @solo_admin
     def registra_evento(self):
         db = self.db
@@ -1534,19 +1592,24 @@ class Gioco:
             return
         ctx, basi = {}, []
         for m, s in coppie:
+            if s is None:
+                p = ask_int(f"Punteggio libero per {m['nome']} (anche negativo): ")
+                basi.append((p, "punteggio libero", False, []))
+                continue
             risultato = self.chiedi_base(a, s, ctx, m["nome"])
             if risultato is None:
                 print("Annullato.")
                 return
             basi.append(risultato)
-        bonus = self.chiedi_bonus_da_applicare(a)
+        bonus = self.chiedi_bonus_da_applicare(a) if any(s for _, s in coppie) else []
         nota = ask("Nota (facoltativa): ")
         gruppo = prossimo_id(db, "gruppo") if len(coppie) > 1 else None
         for (m, s), (base, dettaglio, pending, voti) in zip(coppie, basi):
-            punti = None if pending else calcola_punti(base, bonus)
-            fascia = (s["min"], s["max"]) if a["modalita"] == "sondaggio" else None
-            e = self.aggiungi_evento(m, a, punti, base, bonus, dettaglio, pending, nota, fascia=fascia,
-                                     voti=voti, gruppo=gruppo, ruolo=s["ruolo"] if len(coppie) > 1 else "")
+            b = bonus if s else []
+            punti = None if pending else calcola_punti(base, b)
+            fascia = (s["min"], s["max"]) if s and a["modalita"] == "sondaggio" else None
+            e = self.aggiungi_evento(m, a, punti, base, b, dettaglio, pending, nota, fascia=fascia,
+                                     voti=voti, gruppo=gruppo, ruolo=self.ruolo_evento(a, s))
             dove = f"alla squadra di {m['proprietario']}" if m["proprietario"] else "a nessuno (musicista senza squadra)"
             if pending:
                 print(f"Evento {e['id']} in PENDING per {m['nome']} ({a['nome']}).")
@@ -1566,13 +1629,13 @@ class Gioco:
             return
         punteggi = []
         for m, s in coppie:
-            extra = f" ({s['ruolo']})" if len(coppie) > 1 else ""
+            extra = f" ({s['ruolo']})" if s and len(slot_azione(a)) > 1 else ""
             punteggi.append(ask_int(f"Punteggio finale per {m['nome']}{extra} (anche negativo): "))
         nota = ask("Nota (facoltativa): ")
         gruppo = prossimo_id(db, "gruppo") if len(coppie) > 1 else None
         for (m, s), punti in zip(coppie, punteggi):
             self.aggiungi_evento(m, a, punti, punti, [], "", False, nota, dittatura=True, gruppo=gruppo,
-                                 ruolo=s["ruolo"] if len(coppie) > 1 else "")
+                                 ruolo=self.ruolo_evento(a, s))
             dove = f"alla squadra di {m['proprietario']}" if m["proprietario"] else "a nessuno (musicista senza squadra)"
             print(f"DITTATURA: {punti:+d} a {m['nome']} ({a['nome']}) -> {dove}.")
 
@@ -1978,7 +2041,7 @@ class Gioco:
             if any(m["nome"].lower() == nome.lower() for m in db["musicisti"]):
                 print("Già presente.")
                 continue
-            db["musicisti"].append({"id": prossimo_id(db, "musicista"), "nome": nome,
+            db["musicisti"].append({"id": prossimo_id(db, "musicista"), "nome": nome, "soprannome": "",
                                     "proprietario": None, "prezzo": 0, "profilo": {}})
 
     @solo_admin
@@ -2026,6 +2089,9 @@ class Gioco:
                 print("Esiste già un musicista con questo nome: nome lasciato invariato.")
             else:
                 m["nome"] = nome
+        s = ask(f"Soprannome [{m.get('soprannome') or '-'}] (- per toglierlo): ")
+        if s:
+            m["soprannome"] = "" if s == "-" else s[:30]
         if m["proprietario"]:
             s = ask(f"Prezzo pagato da {m['proprietario']} [{m['prezzo']}]: ")
             if s:
@@ -2052,8 +2118,14 @@ class Gioco:
             print("Ha eventi registrati: eliminali prima oppure lascialo in elenco.")
         elif ask_si(f"Rimuovere {m['nome']}?"):
             db["musicisti"].remove(m)
+            for u in db["utenti"]:
+                prefs(u)["soprannomi_musicisti"].pop(str(m["id"]), None)
             sp = riempi_buco(db, "musicisti", "musicista", m["id"])
             if sp:
+                for u in db["utenti"]:
+                    sopr = prefs(u)["soprannomi_musicisti"]
+                    if str(sp[0]) in sopr:
+                        sopr[str(sp[1])] = sopr.pop(str(sp[0]))
                 for e in db["eventi"]:
                     if e["musicista_id"] == sp[0]:
                         e["musicista_id"] = sp[1]
