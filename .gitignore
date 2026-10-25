@@ -1,2 +1,9 @@
 .venv
+__pycache__
+
+*.pyc
+
+
 fantamusica_dati.json
+test_fantamusica.py
+kivy_test.py
