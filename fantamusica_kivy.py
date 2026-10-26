@@ -46,6 +46,7 @@ from kivy import kivy_data_dir
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.image import Image as CoreImage
+from kivy.core.text import Label as CoreLabel
 from kivy.core.window import Window
 from kivy.graphics import Color, Line, Rectangle
 from kivy.graphics.texture import Texture
@@ -63,6 +64,7 @@ from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 try:
@@ -298,9 +300,14 @@ class L(Label):
             self.bind(size=lambda *_: setattr(self, "text_size", self.size))
 
 
+DIAG = set(os.environ.get("FM_DIAG", "").split(","))      # prove diagnostiche: FM_DIAG=opaco,nofoto,nobordo
+
+
 class Panel(BoxLayout):
     def __init__(self, alpha=0.78, bordo=True, **kw):
         super().__init__(**kw)
+        if "opaco" in DIAG:
+            alpha = 1.0
         with self.canvas.before:
             self._c = Color(*col("panel"), alpha)
             self._r = Rectangle()
@@ -357,17 +364,7 @@ class Avatar(FloatLayout):
         d = dp(dim)
         super().__init__(size_hint=(None, None), size=(d, d), **kw)
         self.azione = azione
-        tex = None
-        p = percorso_foto(foto)
-        if p:
-            try:
-                tex = CoreImage(p).texture
-                w, h = tex.size
-                if w != h:
-                    s = min(w, h)
-                    tex = tex.get_region((w - s) // 2, (h - s) // 2, s, s)
-            except Exception:
-                tex = None
+        tex = texture_foto(foto)
         with self.canvas.before:
             Color(*col("bg1"), 1)
             self._r = Rectangle()
@@ -375,13 +372,12 @@ class Avatar(FloatLayout):
             if tex is not None:
                 Color(1, 1, 1, 1)
                 self._f = Rectangle(texture=tex)
-        with self.canvas.after:
             Color(*col("accent"), 0.9)
             self._l = Line(width=1.2)
         self.bind(pos=self._u, size=self._u)
         if tex is None:
             ini = "".join(w[0] for w in str(nome).split()[:2]).upper() or "?"
-            self.add_widget(L(ini, dim=max(10, dim * 0.4), colore="accent", halign="center", bold=True))
+            self.add_widget(etichetta_iniziali(ini, dim, d))
 
     def _u(self, *_):
         self._r.pos, self._r.size = self.pos, self.size
@@ -402,6 +398,49 @@ class Avatar(FloatLayout):
                 Clock.schedule_once(lambda dt: self.azione(), 0)
             return True
         return super().on_touch_up(touch)
+
+
+def texture_foto(foto):
+    """Texture quadrata (ritaglio centrale) della foto, oppure None."""
+    p = percorso_foto(foto)
+    if not p or "nofoto" in DIAG:
+        return None
+    try:
+        tex = CoreImage(p).texture
+        w, h = tex.size
+        if w != h:
+            s = min(w, h)
+            tex = tex.get_region((w - s) // 2, (h - s) // 2, s, s)
+        return tex
+    except Exception:
+        return None
+
+
+SU_INIZIALI = 0.10      # quanto alzare le iniziali (frazione del lato): il font ha il baricentro verso il basso
+
+
+def etichetta_iniziali(testo, dim_px_dp, d):
+    """Label centrata nel quadrato di lato d (px). Il padding in basso compensa lo spazio sotto la linea di base."""
+    lb = Label(text=testo, font_name=FONT, font_size=sp(max(10, dim_px_dp * 0.4)), bold=True,
+               color=(*col("accent"), 1), halign="center", valign="middle",
+               padding=[0, 0, 0, d * SU_INIZIALI * 2])
+    lb.bind(size=lambda w, *_: setattr(w, "text_size", w.size))
+    return lb
+
+
+def avatar_nella_riga(riga, foto, nome, dim, sposta=0):
+    """Miniatura come figlio diretto della riga: una Panel (la stessa delle righe, già collaudata)
+    con dentro solo un'Image o una Label standard. Nessuna istruzione grafica scritta a mano."""
+    d = dp(dim)
+    cornice = Panel(alpha=1.0, size_hint=(None, None), size=(d, d), padding=dp(1),
+                    pos_hint={"center_y": 0.5})
+    tex = texture_foto(foto)
+    if tex is not None:
+        cornice.add_widget(Image(texture=tex, allow_stretch=True, keep_ratio=False))
+    else:
+        testo = "".join(w[0] for w in str(nome).split()[:2]).upper() or "?"
+        cornice.add_widget(etichetta_iniziali(testo, dim, d))
+    riga.add_widget(cornice)
 
 
 def ancora(w):
@@ -432,6 +471,7 @@ def scroll_list(spacing=6):
     g = GridLayout(cols=1, spacing=dp(spacing), size_hint_y=None, padding=[0, 0, dp(6), 0])
     g.bind(minimum_height=g.setter("height"))
     sv.add_widget(g)
+    sv.bind(scroll_y=lambda *_: g.do_layout())     # le righe seguono subito lo scorrimento (niente ritardo di un frame)
     return sv, g
 
 
@@ -932,7 +972,7 @@ class FantaApp(App):
     # ---------- componenti di lista ----------
     def riga(self, foto, nome, titolo, sotto="", destra="", azione=None, h=62):
         p = (RowBtn if azione else Panel)(size_hint_y=None, height=dp(h), padding=dp(7), spacing=dp(10))
-        p.add_widget(ancora(Avatar(foto, nome, dim=h - 16)))
+        avatar_nella_riga(p, foto, nome, h - 16)
         c = BoxLayout(orientation="vertical")
         c.add_widget(L(titolo, dim=15, colore="accent", bold=True, shorten=True))
         if sotto:
@@ -1451,7 +1491,7 @@ class FantaApp(App):
                 cb = CheckBox(size_hint_x=None, width=dp(34), color=(*col("accent"), 1))
                 cb.bind(active=lambda w, v, i=m["id"], k=chiave: stato[k].add(i) if v else stato[k].discard(i))
                 r.add_widget(cb)
-                r.add_widget(ancora(Avatar(m.get("foto"), m["nome"], dim=32)))
+                avatar_nella_riga(r, m.get("foto"), m["nome"], 32, sposta=dp(34) + dp(6))
                 r.add_widget(L(f"{m['nome']} ({m['prezzo']})", dim=11, shorten=True))
                 gr.add_widget(r)
         riempi("offro", fm.rosa(db, me["nome"]))
@@ -1826,7 +1866,7 @@ class FantaApp(App):
             w.cursor = (len(w.text), 0)
         for m in mus:
             r = RowBtn(size_hint_y=None, height=dp(44), padding=dp(4), spacing=dp(6))
-            r.add_widget(ancora(Avatar(m.get("foto"), m["nome"], dim=32)))
+            avatar_nella_riga(r, m.get("foto"), m["nome"], 32)
             r.add_widget(L(m["nome"], dim=12, shorten=True))
             r.bind(on_release=lambda *_, n=m["nome"]: aggiungi_altro(n))
             gd.add_widget(r)
@@ -2205,49 +2245,55 @@ class FantaApp(App):
             return
         db = self.db
         st = self.live = {"c": c, "busy": False}
+        # Una sola ScrollView per tutta la schermata: su finestre basse o strette niente si sovrappone o esce dallo schermo.
+        sv = ScrollView(bar_color=(*col("accent"), 0.8), bar_inactive_color=(*col("accent"), 0.3),
+                        bar_width=dp(4), scroll_type=["bars", "content"], do_scroll_x=False)
+        g = GridLayout(cols=1, spacing=dp(6), size_hint_y=None, padding=[0, 0, dp(6), dp(10)])
+        g.bind(minimum_height=g.setter("height"))
+        sv.add_widget(g)
+        sv.bind(scroll_y=lambda *_: g.do_layout())
+        self.corpo.add_widget(sv)
+
+        def righe_pulsanti(voci, h=42, dim=11):
+            for i in range(0, len(voci), 2):          # al massimo 2 pulsanti per riga: stanno anche in 320 px
+                r = BoxLayout(size_hint_y=None, height=dp(h), spacing=dp(6))
+                for t, f in voci[i:i + 2]:
+                    r.add_widget(NBtn(t, dim=dim, height=dp(h), on_release=lambda *_, f=f: f()))
+                g.add_widget(r)
+
+        def titolo_sez(t):
+            g.add_widget(L(t, dim=11, colore="accent2", size_hint_y=None, height=dp(24)))
+
+        def lista_piatta():
+            gr = GridLayout(cols=1, spacing=dp(2), size_hint_y=None)
+            gr.bind(minimum_height=gr.setter("height"))
+            g.add_widget(gr)
+            return gr
+
         st["stato"] = L("Connessione in corso...", dim=11, colore="accent2", size_hint_y=None, height=dp(22))
-        self.corpo.add_widget(st["stato"])
-        riga = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        riga.add_widget(NBtn("SINCRONIZZA", dim=11, height=dp(42), on_release=lambda *_: self.live_sync(True)))
-        riga.add_widget(NBtn("CODICI GIOCATORI", dim=11, height=dp(42), on_release=lambda *_: self.f_codici()))
-        self.corpo.add_widget(riga)
+        g.add_widget(st["stato"])
+        righe_pulsanti([("SINCRONIZZA", lambda: self.live_sync(True)), ("CODICI GIOCATORI", self.f_codici)])
         pan = Panel(orientation="vertical", size_hint_y=None, height=dp(78), padding=dp(8), spacing=dp(2))
         st["titolo"] = L("Nessuna asta aperta", dim=17, colore="accent", bold=True, shorten=True)
         st["dettaglio"] = L("", dim=12, colore="accent2", shorten=True)
         pan.add_widget(st["titolo"])
         pan.add_widget(st["dettaglio"])
-        self.corpo.add_widget(BoxLayout(size_hint_y=None, height=dp(6)))
-        self.corpo.add_widget(pan)
-        for voci in ((("AGGIUDICA", self.live_aggiudica), ("ANNULLA ASTA", self.live_annulla),
-                      ("MESSAGGIO", self.f_messaggio_live)),
-                     (("POCO TEMPO", lambda: self.live_invia("Poco tempo!")),
-                      ("ULTIMA CHIAMATA", lambda: self.live_invia("Ultima chiamata!")),
-                      ("CONTO 5", lambda: self.live_conto(5)), ("CONTO 10", lambda: self.live_conto(10)))):
-            r = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
-            for t, f in voci:
-                r.add_widget(NBtn(t, dim=10, height=dp(40), on_release=lambda *_, f=f: f()))
-            self.corpo.add_widget(BoxLayout(size_hint_y=None, height=dp(6)))
-            self.corpo.add_widget(r)
-        cols = BoxLayout(size_hint_y=None, height=dp(170), spacing=dp(6))
+        g.add_widget(pan)
+        righe_pulsanti([("AGGIUDICA", self.live_aggiudica), ("ANNULLA ASTA", self.live_annulla),
+                        ("MESSAGGIO", self.f_messaggio_live), ("POCO TEMPO", lambda: self.live_invia("Poco tempo!")),
+                        ("ULTIMA CHIAMATA", lambda: self.live_invia("Ultima chiamata!")),
+                        ("CONTO 5", lambda: self.live_conto(5)), ("CONTO 10", lambda: self.live_conto(10))],
+                       h=40, dim=10)
         for chiave, tit in (("off", "OFFERTE"), ("msg", "MESSAGGI"), ("on", "SQUADRE (● collegata)")):
-            b = BoxLayout(orientation="vertical")
-            b.add_widget(L(tit, dim=10, colore="accent2", size_hint_y=None, height=dp(20)))
-            sv, gr = scroll_list(2)
-            b.add_widget(sv)
-            cols.add_widget(b)
-            st[chiave] = gr
-        self.corpo.add_widget(BoxLayout(size_hint_y=None, height=dp(6)))
-        self.corpo.add_widget(cols)
-        self.corpo.add_widget(L("MUSICISTI DISPONIBILI (tocca per metterli in asta)", dim=11, colore="accent2",
-                                size_hint_y=None, height=dp(26)))
-        sv, gr = scroll_list()
+            titolo_sez(tit)
+            st[chiave] = lista_piatta()
+        titolo_sez("MUSICISTI DISPONIBILI (tocca per metterli in asta)")
         liberi = [m for m in db["musicisti"] if not m["proprietario"]]
         if not liberi:
-            gr.add_widget(L("Nessun musicista disponibile.", wrap=True))
+            g.add_widget(L("Nessun musicista disponibile.", wrap=True))
         for m in liberi:
-            gr.add_widget(self.riga(m.get("foto"), m["nome"], m["nome"], "base 1 credito", "",
-                                    lambda m=m: self.live_apri(m), h=54))
-        self.corpo.add_widget(sv)
+            g.add_widget(self.riga(m.get("foto"), m["nome"], m["nome"], "base 1 credito", "",
+                                   lambda m=m: self.live_apri(m), h=54))
         self.live_sync(False)
         self._poll = Clock.schedule_interval(self.live_poll, 2)
 
