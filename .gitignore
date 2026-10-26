@@ -1,5 +1,6 @@
 # Dati di gioco (contengono utenti e hash delle password: non vanno pubblicati)
 fantamusica_dati.json
+fantamusica_online.json
 fantamusica_dati.tmp
 *.bak
 backup/
