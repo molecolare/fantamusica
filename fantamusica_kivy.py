@@ -356,34 +356,20 @@ class NBtn(ButtonBehavior, Label):
         self._cf.a = 0.45 if self.state == "down" else 0.10
 
 
-class Avatar(FloatLayout):
-    """Miniatura quadrata a dimensione fissa (dim in dp), disegnata direttamente sul canvas
-    (ritaglio centrale quadrato). Senza foto mostra le iniziali. azione = funzione chiamata al tocco."""
+class Avatar(Panel):
+    """Miniatura quadrata a dimensione fissa (dim in dp): una Panel con dentro un'Image (foto, ritaglio centrale)
+    o una Label con le iniziali. azione = funzione chiamata al tocco."""
 
     def __init__(self, foto=None, nome="?", dim=44, azione=None, **kw):
         d = dp(dim)
-        super().__init__(size_hint=(None, None), size=(d, d), **kw)
+        super().__init__(alpha=1.0, size_hint=(None, None), size=(d, d), padding=dp(1), **kw)
         self.azione = azione
         tex = texture_foto(foto)
-        with self.canvas.before:
-            Color(*col("bg1"), 1)
-            self._r = Rectangle()
-            self._f = None
-            if tex is not None:
-                Color(1, 1, 1, 1)
-                self._f = Rectangle(texture=tex)
-            Color(*col("accent"), 0.9)
-            self._l = Line(width=1.2)
-        self.bind(pos=self._u, size=self._u)
-        if tex is None:
+        if tex is not None:
+            self.add_widget(Image(texture=tex, allow_stretch=True, keep_ratio=False))
+        else:
             ini = "".join(w[0] for w in str(nome).split()[:2]).upper() or "?"
             self.add_widget(etichetta_iniziali(ini, dim, d))
-
-    def _u(self, *_):
-        self._r.pos, self._r.size = self.pos, self.size
-        if self._f is not None:
-            self._f.pos, self._f.size = self.pos, self.size
-        self._l.rectangle = (self.x, self.y, self.width, self.height)
 
     def on_touch_down(self, touch):
         if self.azione and self.collide_point(*touch.pos):
@@ -441,6 +427,20 @@ def avatar_nella_riga(riga, foto, nome, dim, sposta=0):
         testo = "".join(w[0] for w in str(nome).split()[:2]).upper() or "?"
         cornice.add_widget(etichetta_iniziali(testo, dim, d))
     riga.add_widget(cornice)
+
+
+def fissa_info(top, info, minimo=150, gap=4):
+    """Righe di testo con altezza propria (seguono la dimensione del carattere) e un po' d'aria fra loro;
+    il riquadro si allunga quanto serve."""
+    for c in info.children:
+        c.size_hint_y = None
+        c.height = c.font_size * 1.3 + dp(6)
+    info.spacing = dp(gap)
+    info.size_hint_y = None
+    info.pos_hint = {"center_y": 0.5}
+    n = len(info.children)
+    info.height = sum(c.height for c in info.children) + dp(gap) * max(0, n - 1)
+    top.height = max(dp(minimo), info.height + dp(24))
 
 
 def ancora(w):
@@ -515,7 +515,7 @@ class FantaApp(App):
         self.ricostruisci()
         self.stack = [(self.v_setup if self.db is None else self.v_login, ())]
         self.render()
-        Clock.schedule_interval(self.online_tick, 4)
+        self._tick_ev, self._tick_s = Clock.schedule_interval(self.online_tick, 4), 4
         Clock.schedule_once(self.online_avvia, 1)
         return self.radice
 
@@ -583,6 +583,7 @@ class FantaApp(App):
                 ev.cancel()
                 setattr(self, nome, None)
         self.live = None
+        self.online_ritmo(4)
         fn, args = self.stack[-1]
         self.hdr.clear_widgets()
         if self.me and len(self.stack) > 1:
@@ -724,6 +725,13 @@ class FantaApp(App):
                            f"{r.get('versione')}): un altro computer ha pubblicato dati. Cosa vuoi fare?\n\n"
                            "Se usi i dati di questo computer, quelli online vengono sovrascritti.",
                            r.get("versione"))
+
+    def online_ritmo(self, secondi):
+        """Ritmo con cui l'app dell'admin controlla le richieste: 1 s se nell'asta online ci sono 2+ squadre, altrimenti 4 s."""
+        if secondi == getattr(self, "_tick_s", 4) or getattr(self, "_tick_ev", None) is None:
+            return
+        self._tick_ev.cancel()
+        self._tick_ev, self._tick_s = Clock.schedule_interval(self.online_tick, secondi), secondi
 
     def online_tick(self, *_):
         """Ogni 4 secondi: prende le richieste dei giocatori, le applica, pubblica lo stato e risponde."""
@@ -1256,6 +1264,7 @@ class FantaApp(App):
         info.add_widget(L(f"crediti {fm.crediti(db, nome)}/{s['budget_iniziale']}", dim=12))
         info.add_widget(L(f"musicisti {len(r)}/{s['musicisti_per_squadra']}", dim=12))
         top.add_widget(info)
+        fissa_info(top, info)
         g.add_widget(top)
         if self.me is u or self.e_admin():
             r2 = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
@@ -1302,6 +1311,7 @@ class FantaApp(App):
         for c in fm.campi_per(db, "musicisti"):
             info.add_widget(L(f"{c['nome']}: {fm.valore_profilo(m, c)}", dim=11))
         top.add_widget(info)
+        fissa_info(top, info)
         g.add_widget(top)
         g.add_widget(NBtn("IL MIO SOPRANNOME PER QUESTO MUSICISTA", dim=11, height=dp(40),
                           on_release=lambda *_: self.f_mio_soprannome(m)))
@@ -2245,55 +2255,46 @@ class FantaApp(App):
             return
         db = self.db
         st = self.live = {"c": c, "busy": False}
-        # Una sola ScrollView per tutta la schermata: su finestre basse o strette niente si sovrappone o esce dallo schermo.
-        sv = ScrollView(bar_color=(*col("accent"), 0.8), bar_inactive_color=(*col("accent"), 0.3),
-                        bar_width=dp(4), scroll_type=["bars", "content"], do_scroll_x=False)
-        g = GridLayout(cols=1, spacing=dp(6), size_hint_y=None, padding=[0, 0, dp(6), dp(10)])
-        g.bind(minimum_height=g.setter("height"))
-        sv.add_widget(g)
-        sv.bind(scroll_y=lambda *_: g.do_layout())
-        self.corpo.add_widget(sv)
-
-        def righe_pulsanti(voci, h=42, dim=11):
-            for i in range(0, len(voci), 2):          # al massimo 2 pulsanti per riga: stanno anche in 320 px
-                r = BoxLayout(size_hint_y=None, height=dp(h), spacing=dp(6))
-                for t, f in voci[i:i + 2]:
-                    r.add_widget(NBtn(t, dim=dim, height=dp(h), on_release=lambda *_, f=f: f()))
-                g.add_widget(r)
-
-        def titolo_sez(t):
-            g.add_widget(L(t, dim=11, colore="accent2", size_hint_y=None, height=dp(24)))
-
-        def lista_piatta():
-            gr = GridLayout(cols=1, spacing=dp(2), size_hint_y=None)
-            gr.bind(minimum_height=gr.setter("height"))
-            g.add_widget(gr)
-            return gr
-
-        st["stato"] = L("Connessione in corso...", dim=11, colore="accent2", size_hint_y=None, height=dp(22))
-        g.add_widget(st["stato"])
-        righe_pulsanti([("SINCRONIZZA", lambda: self.live_sync(True)), ("CODICI GIOCATORI", self.f_codici)])
-        pan = Panel(orientation="vertical", size_hint_y=None, height=dp(78), padding=dp(8), spacing=dp(2))
-        st["titolo"] = L("Nessuna asta aperta", dim=17, colore="accent", bold=True, shorten=True)
-        st["dettaglio"] = L("", dim=12, colore="accent2", shorten=True)
+        cont = BoxLayout(orientation="vertical", spacing=dp(6))
+        self.corpo.add_widget(cont)
+        st["stato"] = L("Connessione in corso...", dim=11, colore="accent2", size_hint_y=None, height=dp(20))
+        cont.add_widget(st["stato"])
+        voci = [("SINCRONIZZA", lambda: self.live_sync(True)), ("CODICI GIOCATORI", self.f_codici),
+                ("AGGIUDICA", self.live_aggiudica), ("ANNULLA ASTA", self.live_annulla),
+                ("MESSAGGIO", self.f_messaggio_live), ("POCO TEMPO", lambda: self.live_invia("Poco tempo!")),
+                ("ULTIMA CHIAMATA", lambda: self.live_invia("Ultima chiamata!")),
+                ("CONTO 5", lambda: self.live_conto(5)), ("CONTO 10", lambda: self.live_conto(10))]
+        # 3 pulsanti per riga (testo a capo): stanno anche in una finestra stretta; la parte fissa e' compatta
+        gb = GridLayout(cols=3, spacing=dp(5), size_hint_y=None, row_default_height=dp(38), row_force_default=True)
+        gb.bind(minimum_height=gb.setter("height"))
+        for t, f in voci:
+            gb.add_widget(NBtn(t, dim=9, height=dp(38), on_release=lambda *_, f=f: f()))
+        cont.add_widget(gb)
+        pan = Panel(orientation="vertical", size_hint_y=None, height=dp(62), padding=dp(6), spacing=dp(2))
+        st["titolo"] = L("Nessuna asta aperta", dim=15, colore="accent", bold=True, shorten=True)
+        st["dettaglio"] = L("", dim=11, colore="accent2", shorten=True)
         pan.add_widget(st["titolo"])
         pan.add_widget(st["dettaglio"])
-        g.add_widget(pan)
-        righe_pulsanti([("AGGIUDICA", self.live_aggiudica), ("ANNULLA ASTA", self.live_annulla),
-                        ("MESSAGGIO", self.f_messaggio_live), ("POCO TEMPO", lambda: self.live_invia("Poco tempo!")),
-                        ("ULTIMA CHIAMATA", lambda: self.live_invia("Ultima chiamata!")),
-                        ("CONTO 5", lambda: self.live_conto(5)), ("CONTO 10", lambda: self.live_conto(10))],
-                       h=40, dim=10)
-        for chiave, tit in (("off", "OFFERTE"), ("msg", "MESSAGGI"), ("on", "SQUADRE (● collegata)")):
-            titolo_sez(tit)
-            st[chiave] = lista_piatta()
-        titolo_sez("MUSICISTI DISPONIBILI (tocca per metterli in asta)")
+        cont.add_widget(pan)
+        cols = BoxLayout(size_hint_y=None, height=dp(120), spacing=dp(5))
+        for chiave, tit in (("off", "OFFERTE"), ("msg", "MESSAGGI"), ("on", "SQUADRE")):
+            b = BoxLayout(orientation="vertical")
+            b.add_widget(L(tit, dim=9, colore="accent2", size_hint_y=None, height=dp(18)))
+            sv_, gr = scroll_list(2)
+            b.add_widget(sv_)
+            cols.add_widget(b)
+            st[chiave] = gr
+        cont.add_widget(cols)
+        cont.add_widget(L("MUSICISTI DISPONIBILI (tocca per metterli in asta)", dim=10, colore="accent2",
+                          size_hint_y=None, height=dp(20)))
+        sv, gr = scroll_list()
         liberi = [m for m in db["musicisti"] if not m["proprietario"]]
         if not liberi:
-            g.add_widget(L("Nessun musicista disponibile.", wrap=True))
+            gr.add_widget(L("Nessun musicista disponibile.", wrap=True))
         for m in liberi:
-            g.add_widget(self.riga(m.get("foto"), m["nome"], m["nome"], "base 1 credito", "",
-                                   lambda m=m: self.live_apri(m), h=54))
+            gr.add_widget(self.riga(m.get("foto"), m["nome"], m["nome"], "base 1 credito", "",
+                                    lambda m=m: self.live_apri(m), h=54))
+        cont.add_widget(sv)      # l'unico elemento che scorre
         self.live_sync(False)
         self._poll = Clock.schedule_interval(self.live_poll, 2)
 
@@ -2352,6 +2353,7 @@ class FantaApp(App):
         for t in sq:
             voce(st["on"], ("● " if e_collegato(t.get("visto")) else "○ ") + f"{t['nome']} ({t['crediti']} cr.)",
                  "accent" if e_collegato(t.get("visto")) else "testo")
+        self.online_ritmo(1 if sum(1 for t in sq if e_collegato(t.get("visto"))) >= 2 else 4)
 
     def live_chiamata(self, rpc, ok, **par):
         st = self.live
