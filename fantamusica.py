@@ -134,7 +134,11 @@ def nuovo_db():
         # {id, nome, modalita: fisso|sondaggio|tempo, punti, min, max, unita, bonus_ids,
         #  ruolo, extra: [{ruolo, punti, min, max}]}  (ruolo/punti/min/max = primo musicista,
         #  extra = gli altri musicisti coinvolti, ognuno col suo punteggio)
-        "bonus": [],       # {id, nome, tipo: punti|percentuale, valore}
+        "bonus": [],       # {id, nome, tipo: punti|percentuale, valore, bersaglio: azione|musicista|giocatore,
+                           #  musicista_id, giocatore, durata: permanente|eventi|date, eventi_rimasti, da, a}
+                           #  bersaglio "azione": si collega a a["bonus_ids"] e si spunta in fase di registrazione.
+                           #  bersaglio "musicista"/"giocatore": si applica da solo, mentre e' attivo, ai punti
+                           #  di quel musicista o di tutti i musicisti di quella squadra.
         "scambi": [],      # {id, data, da, a, offro, chiedo, nomi_offro, nomi_chiedo, crediti, stato}
         "storico": [],     # stagioni archiviate
         "eventi": [],      # {id, data, musicista_id, azione_id, azione, stato: ok|pending, punti, base,
@@ -215,6 +219,13 @@ def migra(db):
             cambiato = True
         elif isinstance(b["valore"], float) and b["valore"].is_integer():
             b["valore"] = int(b["valore"])
+        imposta(b, "bersaglio", "azione")       # azione|musicista|giocatore
+        imposta(b, "musicista_id", None)
+        imposta(b, "giocatore", None)
+        imposta(b, "durata", "permanente")      # permanente|eventi|date
+        imposta(b, "eventi_rimasti", None)
+        imposta(b, "da", None)
+        imposta(b, "a", None)
     for a in db["azioni"]:
         imposta(a, "modalita", "fisso")
         imposta(a, "min", None)
@@ -245,6 +256,7 @@ def migra(db):
         imposta(e, "voti", [])
         imposta(e, "gruppo", None)
         imposta(e, "ruolo", "")
+        imposta(e, "bonus_auto", [])
         for b in e["bonus"]:
             if "formula" in b or b.get("tipo") not in ("punti", "percentuale"):
                 f = b.pop("formula", None) or b.get("tipo")
@@ -383,6 +395,18 @@ def eventi_ok(db):
     return [e for e in db["eventi"] if e.get("stato", "ok") == "ok"]
 
 
+def gruppo_voto(db, e, lista=None):
+    """Eventi che condividono con e lo stesso voto/sondaggio: stesso gruppo e stesso ruolo, tranne per
+    gli 'altri' coinvolti (ruolo 'extra'), ognuno dei quali vota per se' e non si mescola con gli altri."""
+    lista = db["eventi"] if lista is None else lista
+    ruolo = e.get("ruolo") or ""
+    if not e.get("gruppo"):
+        return [e]
+    trovati = [x for x in lista if x.get("gruppo") == e["gruppo"] and (x.get("ruolo") or "") == ruolo
+               and (ruolo != "extra" or x["musicista_id"] == e["musicista_id"])]
+    return trovati or [e]
+
+
 def eventi_pending(db):
     return [e for e in db["eventi"] if e.get("stato", "ok") == "pending"]
 
@@ -503,6 +527,62 @@ def calcola_punti(base, bonus):
     return totale + math.floor(totale * perc / 100)
 
 
+def musicista(db, mid):
+    return next((m for m in db["musicisti"] if m["id"] == mid), None)
+
+
+def bonus_attivo(b, oggi):
+    """Se un bonus/malus automatico (per musicista o per giocatore) e' ancora attivo oggi."""
+    d = b.get("durata", "permanente")
+    if d == "eventi":
+        return (b.get("eventi_rimasti") or 0) > 0
+    if d == "date":
+        da, a = b.get("da"), b.get("a")
+        return (not da or oggi >= da) and (not a or oggi <= a)
+    return True
+
+
+def bonus_automatici(db, m, oggi=None):
+    """Bonus/malus automatici (bersaglio musicista o giocatore) attivi ora per il musicista m."""
+    oggi = oggi or datetime.now().strftime("%Y-%m-%d")
+    out = []
+    for b in db["bonus"]:
+        bers = b.get("bersaglio", "azione")
+        riguarda = (bers == "musicista" and b.get("musicista_id") == m["id"]) or \
+                   (bers == "giocatore" and m.get("proprietario") and b.get("giocatore") == m["proprietario"])
+        if riguarda and bonus_attivo(b, oggi):
+            out.append(b)
+    return out
+
+
+def applica_bonus_automatici(db, m, punti):
+    """Applica al punteggio gia' calcolato di un musicista i bonus/malus automatici attivi (per musicista
+    o per la sua squadra). Ritorna (punti_finali, [snapshot dei bonus applicati]) e consuma, se del caso,
+    la durata a eventi di quelli appena usati."""
+    attivi = bonus_automatici(db, m)
+    if not attivi:
+        return punti, []
+    finali = calcola_punti(punti, attivi)
+    snap = [{"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"]} for b in attivi]
+    for b in attivi:
+        if b.get("durata") == "eventi":
+            b["eventi_rimasti"] = max(0, (b.get("eventi_rimasti") or 0) - 1)
+    return finali, snap
+
+
+def parse_punteggio_libero(testo):
+    """Punteggio di un musicista 'altro' coinvolto: un intero fisso (anche negativo), oppure un range
+    (es. '1-10', come parse_range) su cui si vota come in un sondaggio. Ritorna ('fisso', valore),
+    ('range', lo, hi) oppure None se il testo non e' valido."""
+    r = parse_range(testo)
+    if r:
+        return ("range",) + r
+    t = testo.strip()
+    if t.lstrip("+-").isdigit() and t.lstrip("+-"):
+        return ("fisso", int(t))
+    return None
+
+
 def parse_voti(testo, lo, hi):
     """'3 4,5' -> [3, 4, 5] se tutti nel range, altrimenti None."""
     voti = []
@@ -559,10 +639,11 @@ def descrivi_calcolo(e):
         parti.append("DITTATURA")
     elif e.get("dettaglio"):
         parti.append(e["dettaglio"])
-    if e.get("bonus") and not e.get("dittatura"):
+    if (e.get("bonus") or e.get("bonus_auto")) and not e.get("dittatura"):
         if e.get("base") is not None:
             parti.append(f"base {e['base']}")
-        parti.extend(descrivi_bonus(b) for b in e["bonus"])
+        parti.extend(descrivi_bonus(b) for b in e.get("bonus", []))
+        parti.extend(descrivi_bonus(b) for b in e.get("bonus_auto", []))
     if e.get("ruolo"):
         parti.append(f"ruolo {e['ruolo']}")
     if e.get("gruppo"):
@@ -1124,15 +1205,27 @@ class Gioco:
     def mostra_azioni(self):
         self.stampa("azioni", self.colonne_azioni(), self.db["azioni"], ("id", False))
 
-    def colonne_bonus(self):
+    def descrivi_bersaglio_bonus(self, b):
         db = self.db
+        if b.get("bersaglio") == "musicista":
+            s = f"musicista: {nome_musicista(db, b['musicista_id'])}"
+        elif b.get("bersaglio") == "giocatore":
+            s = f"giocatore: {b['giocatore']}"
+        else:
+            return ", ".join(a["nome"] for a in db["azioni"] if b["id"] in a["bonus_ids"]) or None
+        d = b.get("durata", "permanente")
+        if d == "eventi":
+            s += f" (per altri {b.get('eventi_rimasti') or 0} eventi)"
+        elif d == "date":
+            s += f" (dal {b.get('da') or '...'} al {b.get('a') or '...'})"
+        return s
+
+    def colonne_bonus(self):
         return [Col("id", "ID", lambda b: b["id"], ">"),
                 Col("nome", "Nome", lambda b: b["nome"]),
                 Col("valore", "Valore", lambda b: b["valore"], ">",
                     fmt=lambda v, b: fmt_segno(v) + ("%" if b["tipo"] == "percentuale" else "")),
-                Col("azioni", "Collegato a",
-                    lambda b: ", ".join(a["nome"] for a in db["azioni"] if b["id"] in a["bonus_ids"]) or None,
-                    ordinabile=False)]
+                Col("azioni", "Si applica a", self.descrivi_bersaglio_bonus, ordinabile=False)]
 
     def mostra_bonus(self):
         self.stampa("bonus", self.colonne_bonus(), self.db["bonus"], ("id", False))
@@ -1630,17 +1723,21 @@ class Gioco:
         return s["punti"], "", False, []
 
     def chiedi_bonus_da_applicare(self, a):
-        """Per ogni bonus/malus collegato all'azione chiede se applicarlo (valore gia' fissato)."""
+        """Per ogni bonus/malus collegato all'azione (bersaglio 'azione': gli altri si applicano da soli)
+        chiede se applicarlo (valore gia' fissato)."""
         scelti = []
         for i in a["bonus_ids"]:
             b = next((x for x in self.db["bonus"] if x["id"] == i), None)
-            if b and ask_si(f"Applicare {descrivi_bonus(b)}?"):
+            if b and b.get("bersaglio", "azione") == "azione" and ask_si(f"Applicare {descrivi_bonus(b)}?"):
                 scelti.append({"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"]})
         return scelti
 
     def aggiungi_evento(self, m, a, punti, base, bonus, dettaglio, pending, nota, dittatura=False,
                         fascia=None, voti=None, gruppo=None, ruolo=""):
         db = self.db
+        bonus_auto = []
+        if not pending and not dittatura:
+            punti, bonus_auto = applica_bonus_automatici(db, m, punti)
         e = {
             "id": prossimo_id(db, "evento"),
             "data": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -1651,6 +1748,7 @@ class Gioco:
             "punti": 0 if pending else punti,
             "base": None if pending else base,
             "bonus": bonus,
+            "bonus_auto": bonus_auto,
             "voti": list(voti or []),
             "gruppo": gruppo,
             "ruolo": ruolo,
@@ -1680,21 +1778,32 @@ class Gioco:
         ctx, basi = {}, []
         for m, s in coppie:
             if s is None:
-                p = ask_int(f"Punteggio libero per {m['nome']} (anche negativo): ")
-                basi.append((p, "punteggio libero", False, []))
+                while True:
+                    r = ask(f"Punteggio libero per {m['nome']} (anche negativo), oppure un range "
+                            f"(es. 1-10) su cui votare come in un sondaggio: ")
+                    esito = parse_punteggio_libero(r)
+                    if esito is None:
+                        print("Inserisci un intero (anche negativo) oppure un range tipo 1-10.")
+                        continue
+                    break
+                if esito[0] == "fisso":
+                    basi.append((esito[1], "punteggio libero", False, [], None))
+                else:
+                    basi.append((None, "", True, [], (esito[1], esito[2])))
                 continue
             risultato = self.chiedi_base(a, s, ctx, m["nome"])
             if risultato is None:
                 print("Annullato.")
                 return
-            basi.append(risultato)
+            base, dettaglio, pending, voti = risultato
+            fascia = (s["min"], s["max"]) if a["modalita"] == "sondaggio" else None
+            basi.append((base, dettaglio, pending, voti, fascia))
         bonus = self.chiedi_bonus_da_applicare(a)
         nota = ask("Nota (facoltativa): ")
         gruppo = prossimo_id(db, "gruppo") if len(coppie) > 1 else None
-        for (m, s), (base, dettaglio, pending, voti) in zip(coppie, basi):
+        for (m, s), (base, dettaglio, pending, voti, fascia) in zip(coppie, basi):
             b = bonus
             punti = None if pending else calcola_punti(base, b)
-            fascia = (s["min"], s["max"]) if s and a["modalita"] == "sondaggio" else None
             e = self.aggiungi_evento(m, a, punti, base, b, dettaglio, pending, nota, fascia=fascia,
                                      voti=voti, gruppo=gruppo, ruolo=self.ruolo_evento(a, s))
             dove = f"alla squadra di {m['proprietario']}" if m["proprietario"] else "a nessuno (musicista senza squadra)"
@@ -1736,8 +1845,7 @@ class Gioco:
                                self.mostra_pending)
         if not e:
             return
-        gruppo = [x for x in eventi_pending(db) if e.get("gruppo") and x.get("gruppo") == e["gruppo"]
-                  and (x.get("ruolo") or "") == (e.get("ruolo") or "")] or [e]
+        gruppo = gruppo_voto(db, e, eventi_pending(db))
         az = next((a for a in db["azioni"] if a["id"] == e.get("azione_id")), None)
         lo, hi = (e.get("fascia") or ((az["min"], az["max"]) if az else (1, 10)))
         voti = list(e.get("voti", []))
@@ -1767,7 +1875,11 @@ class Gioco:
             base, dettaglio = base_da_voti(voti)
             for x in gruppo:
                 x["voti"], x["base"], x["dettaglio"] = list(voti), base, dettaglio
-                x["punti"] = calcola_punti(base, x["bonus"])
+                punti = calcola_punti(base, x["bonus"])
+                if not x.get("dittatura"):
+                    m = musicista(db, x["musicista_id"])
+                    punti, x["bonus_auto"] = applica_bonus_automatici(db, m, punti) if m else (punti, [])
+                x["punti"] = punti
                 x["stato"] = "ok"
                 x["data_completamento"] = datetime.now().strftime("%Y-%m-%d %H:%M")
                 print(f"Evento {x['id']} completato: {x['punti']:+d} punti "
@@ -2203,6 +2315,8 @@ class Gioco:
             print("Prima svincolalo dalla squadra.")
         elif any(e["musicista_id"] == m["id"] for e in db["eventi"]):
             print("Ha eventi registrati: eliminali prima oppure lascialo in elenco.")
+        elif any(b.get("musicista_id") == m["id"] for b in db["bonus"] if b.get("bersaglio") == "musicista"):
+            print("Ha un bonus/malus collegato: eliminalo prima.")
         elif ask_si(f"Rimuovere {m['nome']}?"):
             db["musicisti"].remove(m)
             for u in db["utenti"]:
@@ -2213,6 +2327,9 @@ class Gioco:
                     sopr = prefs(u)["soprannomi_musicisti"]
                     if str(sp[0]) in sopr:
                         sopr[str(sp[1])] = sopr.pop(str(sp[0]))
+                for b in db["bonus"]:
+                    if b.get("bersaglio") == "musicista" and b.get("musicista_id") == sp[0]:
+                        b["musicista_id"] = sp[1]
                 for e in db["eventi"]:
                     if e["musicista_id"] == sp[0]:
                         e["musicista_id"] = sp[1]
@@ -2466,6 +2583,59 @@ class Gioco:
             return
         self.vista("bonus", self.colonne_bonus(), self.db["bonus"], ("id", False))
 
+    def chiedi_bersaglio_bonus(self, b=None):
+        """Bersaglio di un bonus/malus: azione (si spunta in fase di registrazione), un musicista
+        specifico, oppure un giocatore/squadra (si applica da solo mentre è attivo).
+        Ritorna (bersaglio, musicista_id, giocatore) oppure None se annullato."""
+        db = self.db
+        corrente = ""
+        if b:
+            if b["bersaglio"] == "musicista":
+                corrente = f" [attuale: musicista {nome_musicista(db, b['musicista_id'])}]"
+            elif b["bersaglio"] == "giocatore":
+                corrente = f" [attuale: giocatore {b['giocatore']}]"
+            else:
+                corrente = " [attuale: azione (da collegare e spuntare)]"
+        print(f"A chi si applica questo bonus/malus?{corrente}")
+        print("  1. A un'azione (lo spunti tu in fase di registrazione, come oggi)")
+        print("  2. A un musicista specifico (si applica da solo quando segna)")
+        print("  3. A un giocatore/squadra (si applica da solo a tutti i suoi musicisti quando segnano)")
+        s = ask("> ")
+        if not s:
+            return None
+        if s == "1":
+            return "azione", None, None
+        if s == "2":
+            m = self.scegli_per_id(db["musicisti"], "ID musicista (invio per annullare): ", self.mostra_musicisti)
+            return ("musicista", m["id"], None) if m else None
+        if s == "3":
+            g = self.chiedi_utente("Nome del giocatore (invio per annullare): ")
+            return ("giocatore", None, g["nome"]) if g else None
+        print("Scelta non valida.")
+        return None
+
+    def chiedi_durata_bonus(self, b=None):
+        """Durata di un bonus/malus automatico (per musicista o per giocatore).
+        Ritorna (durata, eventi_rimasti, da, a) oppure None se annullato."""
+        print("Per quanto resta attivo?")
+        print("  1. Permanente, finché non lo elimini tu")
+        print("  2. Per i prossimi N eventi che coinvolgono il bersaglio")
+        print("  3. In un intervallo di date")
+        s = ask("> ")
+        if not s:
+            return None
+        if s == "1":
+            return "permanente", None, None, None
+        if s == "2":
+            n = ask_int("Per quanti eventi resta attivo: ", minimo=1)
+            return ("eventi", n, None, None) if n else None
+        if s == "3":
+            da = ask("Data di inizio (AAAA-MM-GG, invio = da subito): ").strip() or None
+            a = ask("Data di fine (AAAA-MM-GG, invio = senza fine): ").strip() or None
+            return "date", None, da, a
+        print("Scelta non valida.")
+        return None
+
     def chiedi_valore_bonus(self, attuale=None):
         """Valore di un bonus/malus: punti interi ('+5', '-3') o percentuale ('20%', '-10%').
         Ritorna (tipo, valore)."""
@@ -2491,11 +2661,24 @@ class Gioco:
         if any(b["nome"].lower() == nome.lower() for b in db["bonus"]):
             print("Esiste già un bonus/malus con questo nome.")
             return
+        bers = self.chiedi_bersaglio_bonus()
+        if bers is None:
+            print("Annullato.")
+            return
+        bersaglio, musicista_id, giocatore = bers
         tipo, valore = self.chiedi_valore_bonus()
-        b = {"id": prossimo_id(db, "bonus"), "nome": nome, "tipo": tipo, "valore": valore}
+        b = {"id": prossimo_id(db, "bonus"), "nome": nome, "tipo": tipo, "valore": valore,
+             "bersaglio": bersaglio, "musicista_id": musicista_id, "giocatore": giocatore,
+             "durata": "permanente", "eventi_rimasti": None, "da": None, "a": None}
+        if bersaglio != "azione":
+            durata = self.chiedi_durata_bonus()
+            if durata is None:
+                print("Annullato.")
+                return
+            b["durata"], b["eventi_rimasti"], b["da"], b["a"] = durata
         db["bonus"].append(b)
         print(f"Aggiunto: {descrivi_bonus(b)}.")
-        if db["azioni"]:
+        if bersaglio == "azione" and db["azioni"]:
             self.scegli_azioni_per_bonus(b)
 
     @solo_admin
@@ -2514,6 +2697,16 @@ class Gioco:
             else:
                 b["nome"] = nome
         b["tipo"], b["valore"] = self.chiedi_valore_bonus(b)
+        if ask_si("Cambiare anche il bersaglio e la durata?"):
+            bers = self.chiedi_bersaglio_bonus(b)
+            if bers is not None:
+                b["bersaglio"], b["musicista_id"], b["giocatore"] = bers
+                if b["bersaglio"] == "azione":
+                    b["durata"], b["eventi_rimasti"], b["da"], b["a"] = "permanente", None, None, None
+                else:
+                    durata = self.chiedi_durata_bonus(b)
+                    if durata is not None:
+                        b["durata"], b["eventi_rimasti"], b["da"], b["a"] = durata
         print("Aggiornato (gli eventi già registrati non cambiano).")
 
     @solo_admin
@@ -2560,10 +2753,12 @@ class Gioco:
     @solo_admin
     def collega_bonus(self):
         db = self.db
-        if not db["bonus"] or not db["azioni"]:
-            print("Servono almeno un bonus/malus e un'azione.")
+        collegabili = [b for b in db["bonus"] if b.get("bersaglio", "azione") == "azione"]
+        if not collegabili or not db["azioni"]:
+            print("Servono almeno un bonus/malus con bersaglio 'azione' e un'azione.")
             return
-        b = self.scegli_per_id(db["bonus"], "ID bonus/malus da collegare (invio per annullare): ", self.mostra_bonus)
+        b = self.scegli_per_id(collegabili, "ID bonus/malus da collegare (invio per annullare): ",
+                               lambda: self.stampa("bonus", self.colonne_bonus(), collegabili, ("id", False)))
         if b:
             self.scegli_azioni_per_bonus(b)
 
@@ -2665,7 +2860,13 @@ class Gioco:
         for x in db["scambi"]:
             if x["stato"] == "proposto" and u["nome"] in (x["da"], x["a"]):
                 x["stato"] = "annullato"
+        tolti = [b for b in db["bonus"] if b.get("bersaglio") == "giocatore" and b.get("giocatore") == u["nome"]]
+        for b in tolti:
+            db["bonus"].remove(b)
+            riempi_buco(db, "bonus", "bonus", b["id"])
         db["utenti"].remove(u)
+        if tolti:
+            print(f"Eliminati anche {len(tolti)} bonus/malus collegati a lui.")
         print("Utente eliminato.")
 
     # ----- caratteristiche dei profili -----

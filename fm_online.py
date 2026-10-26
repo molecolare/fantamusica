@@ -192,38 +192,42 @@ def _evento(db, me, p):
                 voti = fm.parse_voti(testo, s["min"], s["max"])
                 if not voti or len(voti) != 1:
                     raise RichiestaNonValida(f"Il voto per {m['nome']} deve essere un intero da {s['min']} a {s['max']}")
-            basi.append((None, "", voti))
+            basi.append((None, "", voti, (s["min"], s["max"])))
         elif a["modalita"] == "tempo":
             if qta is None:
                 qta = fm.parse_numero(str(p.get("quantita", "")))
                 if qta is None or qta <= 0:
                     raise RichiestaNonValida("Serve una quantità maggiore di zero")
             basi.append((fm.arrotonda(qta * s["punti"]),
-                         f"{fm.fmt_valore(qta)} {a['unita']} x {s['punti']:+d}", []))
+                         f"{fm.fmt_valore(qta)} {a['unita']} x {s['punti']:+d}", [], None))
         else:
-            basi.append((s["punti"], "", []))
+            basi.append((s["punti"], "", [], None))
         coppie.append((m, s))
     for x in (p.get("altri") or [])[:20]:
         m = _musicista(db, x.get("musicista_id"))
         if m["id"] in presi:
             raise RichiestaNonValida(f"{m['nome']} è già coinvolto")
         presi.add(m["id"])
-        punti = _intero(x.get("punti"), f"punteggio di {m['nome']}")
-        if abs(punti) > 1000:
-            raise RichiestaNonValida("Punteggio troppo grande")
+        esito = fm.parse_punteggio_libero(str(x.get("punti", "")))
+        if esito is None:
+            raise RichiestaNonValida(f"Punteggio di {m['nome']} non valido")
         coppie.append((m, None))
-        basi.append((punti, "punteggio libero", []))
+        if esito[0] == "fisso":
+            if abs(esito[1]) > 1000:
+                raise RichiestaNonValida("Punteggio troppo grande")
+            basi.append((esito[1], "punteggio libero", [], None))
+        else:
+            basi.append((None, "", [], (esito[1], esito[2])))
     validi = set(a.get("bonus_ids", []))
     bonus = []
     for i in p.get("bonus_ids") or []:
         b = next((y for y in db["bonus"] if y["id"] == _intero(i, "bonus")), None)
-        if b and b["id"] in validi:
+        if b and b["id"] in validi and b.get("bersaglio", "azione") == "azione":
             bonus.append({"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"]})
     nota = str(p.get("nota") or "").strip()[:200]
     gruppo = fm.prossimo_id(db, "gruppo") if len(coppie) > 1 else None
     creati = []
-    for (m, s), (base, dett, voti) in zip(coppie, basi):
-        fascia = (s["min"], s["max"]) if s and a["modalita"] == "sondaggio" else None
+    for (m, s), (base, dett, voti, fascia) in zip(coppie, basi):
         e = g.aggiungi_evento(m, a, None, base, bonus, dett, True, nota, fascia=fascia, voti=voti,
                               gruppo=gruppo, ruolo=g.ruolo_evento(a, s))
         e["da_approvare"], e["proposto_da"] = True, me["nome"]
@@ -305,7 +309,8 @@ def _voto(db, me, p):
     if not e or e.get("stato") != "pending":
         raise RichiestaNonValida("L'evento non è più in pending")
     a = next((x for x in db["azioni"] if x["id"] == e.get("azione_id")), None)
-    if not a or a["modalita"] != "sondaggio":
+    extra = (e.get("ruolo") or "") == "extra"
+    if not e.get("fascia") and (extra or not (a and a["modalita"] == "sondaggio")):
         raise RichiestaNonValida("Questo evento non prevede un sondaggio")
     lo, hi = e.get("fascia") or (a["min"], a["max"])
     voti = fm.parse_voti(str(p.get("voto", "")), lo, hi)
@@ -313,8 +318,7 @@ def _voto(db, me, p):
         raise RichiestaNonValida(f"Il voto deve essere un intero da {lo} a {hi}")
     if me["nome"] in e.get("votanti", []):
         raise RichiestaNonValida("Hai già votato questo evento")
-    gruppo = [x for x in db["eventi"] if x.get("stato") == "pending" and e.get("gruppo")
-              and x.get("gruppo") == e["gruppo"] and (x.get("ruolo") or "") == (e.get("ruolo") or "")] or [e]
+    gruppo = fm.gruppo_voto(db, e, [x for x in db["eventi"] if x.get("stato") == "pending"])
     for x in gruppo:
         x.setdefault("voti", []).append(voti[0])
         x.setdefault("votanti", []).append(me["nome"])

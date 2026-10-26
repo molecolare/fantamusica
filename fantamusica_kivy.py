@@ -748,7 +748,7 @@ class FantaApp(App):
             scrivi_cfg(self.cfg)
 
     def online_ritmo(self, secondi):
-        """Ritmo dei controlli: 1 s se nell'asta online ci sono 2+ squadre collegate, altrimenti 4 s."""
+        """Ritmo dei controlli: 0.5 s se nell'asta online ci sono 2+ squadre collegate, altrimenti 4 s."""
         if secondi == getattr(self, "_tick_s", 4) or getattr(self, "_tick_ev", None) is None:
             return
         self._tick_ev.cancel()
@@ -1839,8 +1839,7 @@ class FantaApp(App):
         griglia = GridLayout(cols=2, spacing=dp(10), size_hint_y=None, row_default_height=dp(70),
                              row_force_default=True)
         griglia.bind(minimum_height=griglia.setter("height"))
-        voci = [("REGISTRA EVENTO", lambda: self.f_evento(False)),
-                ("DITTATURA (punteggio a mano)", lambda: self.f_evento(True)),
+        voci = [("DITTATURA (punteggio a mano)", lambda: self.f_evento(True)),
                 ("PENDING: VOTI E COMPLETAMENTO", lambda: self.vai(self.v_pending)),
                 ("ASTA MUSICISTI", lambda: self.vai(self.v_asta)),
                 ("GESTIONE MUSICISTI", lambda: self.vai(self.v_gest_musicisti)),
@@ -1973,7 +1972,8 @@ class FantaApp(App):
                                  height=dp(20)))
                 st["qta"] = campo(hint="es. 90 oppure 1,5")
                 dyn.add_widget(st["qta"])
-            dyn.add_widget(L("Altri musicisti coinvolti (facoltativo), formato NOME:punti, es. Mario Rossi:5, Anna:-2",
+            dyn.add_widget(L("Altri musicisti coinvolti (facoltativo), formato NOME:punti, es. Mario Rossi:5, Anna:-2 "
+                             "(oppure un range come Mario Rossi:4-9, va a sondaggio)",
                              dim=11, colore="accent2", size_hint_y=None, height=dp(34)))
             st["altri"] = campo()
             dyn.add_widget(st["altri"])
@@ -2009,69 +2009,85 @@ class FantaApp(App):
                     except ValueError:
                         self.msg(f"Punteggio finale non valido per {m['nome']}.")
                         return
-                    basi.append((p, "", False, []))
+                    basi.append((p, "", False, [], None))
                 elif a["modalita"] == "sondaggio":
                     if not w.text.strip():
-                        basi.append((None, "", True, []))
+                        basi.append((None, "", True, [], (s["min"], s["max"])))
                     else:
                         voti = fm.parse_voti(w.text, s["min"], s["max"])
                         if voti is None:
                             self.msg(f"Per {m['nome']} inserisci interi da {s['min']} a {s['max']}.")
                             return
                         b, d = fm.base_da_voti(voti)
-                        basi.append((b, d, False, voti))
+                        basi.append((b, d, False, voti, (s["min"], s["max"])))
                 elif a["modalita"] == "tempo":
                     q = fm.parse_numero(st["qta"].text.strip()) if st["qta"].text.strip() else None
                     if q is None or q <= 0:
                         self.msg("Serve una quantità maggiore di zero.")
                         return
                     basi.append((fm.arrotonda(q * s["punti"]),
-                                 f"{fm.fmt_valore(q)} {a['unita']} x {s['punti']:+d}", False, []))
+                                 f"{fm.fmt_valore(q)} {a['unita']} x {s['punti']:+d}", False, [], None))
                 else:
-                    basi.append((s["punti"], "", False, []))
+                    basi.append((s["punti"], "", False, [], None))
             txt = st["altri"].text.strip()
             for pezzo in txt.replace(";", ",").split(","):
                 if not pezzo.strip():
                     continue
                 nome_, _, pt = pezzo.rpartition(":")
                 m = next((x for x in db["musicisti"] if x["nome"].lower() == nome_.strip().lower()), None)
-                try:
-                    p = int(pt.strip())
-                except ValueError:
-                    p = None
-                if not m or p is None:
+                if not m:
                     self.msg(f"'{pezzo.strip()}' non valido: usa NOME:punti con un musicista esistente "
-                             f"(es. Mario Rossi:5).")
+                             f"(es. Mario Rossi:5 o Mario Rossi:4-9).")
                     return
                 if any(x["id"] == m["id"] for x, _s in coppie):
                     self.msg(f"{m['nome']} è già coinvolto.")
                     return
                 coppie.append((m, None))
-                basi.append((p, "" if dittatura else "punteggio libero", False, []))
-            bonus = [{"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"]}
-                     for cb, b in st["bonus"] if cb.active]
-            nota = st["nota"].text.strip()
-            gruppo = fm.prossimo_id(db, "gruppo") if len(coppie) > 1 else None
-            esiti = []
-            for (m, s), (base, dett, pending, voti) in zip(coppie, basi):
-                ruolo = self.g.ruolo_evento(a, s)
-                fascia = (s["min"], s["max"]) if s and a["modalita"] == "sondaggio" else None
                 if dittatura:
-                    self.g.aggiungi_evento(m, a, base, base, [], "", False, nota, dittatura=True,
-                                           gruppo=gruppo, ruolo=ruolo)
-                    esiti.append(f"{base:+d} a {m['nome']} (DITTATURA)")
-                elif proposta:
-                    e = self.g.aggiungi_evento(m, a, None, base, bonus, dett, True, nota, fascia=fascia,
-                                               voti=voti, gruppo=gruppo, ruolo=ruolo)
-                    # sondaggio: il voto del giocatore resta fra i voti, l'admin può aggiungerne altri e chiudere
-                    e["da_approvare"], e["proposto_da"] = True, me["nome"]
-                    e["proposta_base"] = None if (s and a["modalita"] == "sondaggio") else base
-                    esiti.append(f"{m['nome']}: in attesa di conferma")
+                    try:
+                        p = int(pt.strip())
+                    except ValueError:
+                        self.msg(f"Punteggio di {m['nome']} non valido.")
+                        return
+                    basi.append((p, "", False, [], None))
+                    continue
+                esito = fm.parse_punteggio_libero(pt.strip())
+                if esito is None:
+                    self.msg(f"Punteggio di {m['nome']} non valido: usa un intero (anche negativo) o un "
+                             f"range come 4-9.")
+                    return
+                if esito[0] == "fisso":
+                    basi.append((esito[1], "punteggio libero", False, [], None))
                 else:
-                    punti = None if pending else fm.calcola_punti(base, bonus)
-                    self.g.aggiungi_evento(m, a, punti, base, bonus, dett, pending, nota, fascia=fascia,
-                                           voti=voti, gruppo=gruppo, ruolo=ruolo)
-                    esiti.append(f"{m['nome']}: " + ("PENDING" if pending else f"{punti:+d}"))
+                    basi.append((None, "", True, [], (esito[1], esito[2])))
+                bonus_principali = [{"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"]}
+                                    for cb, b in st["bonus"] if cb.active]
+                nota = st["nota"].text.strip()
+                gruppo = fm.prossimo_id(db, "gruppo") if len(coppie) > 1 else None
+                esiti = []
+                for (m, s), (base, dett, pending, voti, fascia) in zip(coppie, basi):
+                    ruolo = self.g.ruolo_evento(a, s)
+
+                    # SE s IS NOT NONE SIGNIFICA CHE È UN ID PRINCIPALE (HA UNO SLOT), ALTRIMENTI È UN MUSICISTA AGGIUNTIVO
+                    bonus_correnti = bonus_principali if s is not None else []
+
+                    if dittatura:
+                        self.g.aggiungi_evento(m, a, base, base, [], "", False, nota, dittatura=True,
+                                                gruppo=gruppo, ruolo=ruolo)
+                        esiti.append(f"{base:+d} a {m['nome']} (DITTATURA)")
+                    elif proposta:
+                        e = self.g.aggiungi_evento(m, a, None, base, bonus_correnti, dett, True, nota, fascia=fascia,
+                                                    voti=voti, gruppo=gruppo, ruolo=ruolo)
+                        # sondaggio: il voto del giocatore resta fra i voti, l'admin può aggiungerne altri e chiudere
+                        e["da_approvare"], e["proposto_da"] = True, me["nome"]
+                        e["proposta_base"] = None if (s and a["modalita"] == "sondaggio") else base
+                        esiti.append(f"{m['nome']}: in attesa di conferma")
+                    else:
+                        punti = None if pending else fm.calcola_punti(base, bonus_correnti)
+                        self.g.aggiungi_evento(m, a, punti, base, bonus_correnti, dett, pending, nota, fascia=fascia,
+                                                voti=voti, gruppo=gruppo, ruolo=ruolo)
+                        esiti.append(f"{m['nome']}: " + ("PENDING" if pending else f"{punti:+d}"))
+
             self.salva()
             pop.dismiss()
             self.msg(("Proposta inviata: l'admin la confermerà dalla sezione Pending.\n" if proposta
@@ -2099,11 +2115,15 @@ class FantaApp(App):
 
     def f_pending(self, e):
         db = self.db
-        gruppo = [x for x in fm.eventi_pending(db) if e.get("gruppo") and x.get("gruppo") == e["gruppo"]
-                  and (x.get("ruolo") or "") == (e.get("ruolo") or "")] or [e]
+        gruppo = fm.gruppo_voto(db, e, fm.eventi_pending(db))
         tutto_gruppo = [x for x in fm.eventi_pending(db) if e.get("gruppo") and x.get("gruppo") == e["gruppo"]] or [e]
         az = next((a for a in db["azioni"] if a["id"] == e.get("azione_id")), None)
-        lo, hi = (e.get("fascia") or ((az["min"], az["max"]) if az else (1, 10)))
+        if e.get("fascia"):
+            lo, hi = e["fascia"]
+        elif (e.get("ruolo") or "") == "extra":
+            lo, hi = (1, 10)
+        else:
+            lo, hi = (az["min"], az["max"]) if az else (1, 10)
         voti = list(e.get("voti", []))
         ha_proposta = e.get("proposta_base") is not None
         info = e["azione"]
@@ -2147,7 +2167,11 @@ class FantaApp(App):
                 base, dett = fm.base_da_voti(tot)
                 for x in gruppo:
                     x["voti"], x["base"], x["dettaglio"] = list(tot), base, dett
-                    x["punti"] = fm.calcola_punti(base, x["bonus"])
+                    punti = fm.calcola_punti(base, x["bonus"])
+                    if not x.get("dittatura"):
+                        mx = fm.musicista(db, x["musicista_id"])
+                        punti, x["bonus_auto"] = fm.applica_bonus_automatici(db, mx, punti) if mx else (punti, [])
+                    x["punti"] = punti
                     x["stato"] = "ok"
                     x["da_approvare"] = False
                     x["data_completamento"] = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -2162,7 +2186,11 @@ class FantaApp(App):
             for x in tutto_gruppo:
                 if x.get("proposta_base") is not None:
                     x["base"] = x["proposta_base"]
-                    x["punti"] = fm.calcola_punti(x["base"], x["bonus"])
+                    punti = fm.calcola_punti(x["base"], x["bonus"])
+                    if not x.get("dittatura"):
+                        mx = fm.musicista(db, x["musicista_id"])
+                        punti, x["bonus_auto"] = fm.applica_bonus_automatici(db, mx, punti) if mx else (punti, [])
+                    x["punti"] = punti
                     x["stato"], x["da_approvare"], x["data_completamento"] = "ok", False, adesso
             self.finito(pop)
 
@@ -2173,7 +2201,7 @@ class FantaApp(App):
                     fm.riempi_buco(db, "eventi", "evento", x["id"])
             self.finito(pop)
         if ha_proposta:
-            box.add_widget(NBtn("CONFERMA COME PROPOSTO", on_release=lambda *_: conferma()))
+            box.add_widget(NBtn("CONFERMA PUNTI", on_release=lambda *_: conferma()))
         else:
             box.add_widget(NBtn("SALVA I VOTI (RESTA IN PENDING)", on_release=lambda *_: applica(False)))
             box.add_widget(NBtn("CHIUDI L'EVENTO CON LA MEDIA", on_release=lambda *_: applica(True)))
@@ -2416,7 +2444,7 @@ class FantaApp(App):
         for t in sq:
             voce(st["on"], ("● " if e_collegato(t.get("visto")) else "○ ") + f"{t['nome']} ({t['crediti']} cr.)",
                  "accent" if e_collegato(t.get("visto")) else "testo")
-        self.online_ritmo(1 if sum(1 for t in sq if e_collegato(t.get("visto"))) >= 2 else 4)
+        self.online_ritmo(0.5 if sum(0.5 for t in sq if e_collegato(t.get("visto"))) >= 2 else 4)
 
     def live_chiamata(self, rpc, ok, **par):
         st = self.live
