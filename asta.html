@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FantaMusica - Asta live</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  :root { --bg1:#010d08; --bg2:#05381c; --accent:#40ff80; --accent2:#b3ff59; --testo:#b8ffcc; --panel:rgba(5,28,16,.82); --rosso:#ff5a5a; }
+  [data-tema="blu"]     { --bg1:#020814; --bg2:#08204d; --accent:#33bfff; --accent2:#73f2ff; --testo:#bfe5ff; --panel:rgba(5,18,43,.82); }
+  [data-tema="arancio"] { --bg1:#120803; --bg2:#472105; --accent:#ff8c1f; --accent2:#ffcc40; --testo:#ffdfb8; --panel:rgba(36,15,5,.82); }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body { font-family: "Courier New", ui-monospace, Menlo, Consolas, monospace; color: var(--testo);
+         background: linear-gradient(0deg, var(--bg2), var(--bg1)) fixed; font-size: 15px; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--accent);
+           background: var(--panel); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
+  h1 { font-size: 18px; margin: 0; color: var(--accent); letter-spacing: 1px; flex: 1; text-shadow: 0 0 8px var(--accent); }
+  h2 { font-size: 13px; margin: 0 0 8px; color: var(--accent2); letter-spacing: 1px; text-transform: uppercase; }
+  .temi button { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--testo); margin-left: 6px; cursor: pointer; padding: 0; }
+  main { max-width: 1100px; margin: 0 auto; padding: 14px; display: grid; gap: 14px; grid-template-columns: 1fr; }
+  @media (min-width: 900px) { main.griglia { grid-template-columns: 1.15fr 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--accent); padding: 14px; box-shadow: 0 0 14px rgba(0,0,0,.35), inset 0 0 18px rgba(0,0,0,.25); }
+  .grande { font-size: 24px; color: var(--accent); font-weight: bold; text-shadow: 0 0 8px var(--accent); word-break: break-word; }
+  .dim { opacity: .7; font-size: 13px; }
+  input { font: inherit; background: var(--bg1); color: var(--testo); border: 1px solid var(--accent); padding: 10px; width: 100%; }
+  button.n { font: inherit; font-weight: bold; color: var(--accent); background: rgba(0,0,0,.25); border: 1px solid var(--accent);
+             padding: 10px 14px; cursor: pointer; text-transform: uppercase; box-shadow: 0 0 8px rgba(0,0,0,.4); }
+  button.n:hover:not(:disabled) { background: var(--accent); color: var(--bg1); }
+  button.n:disabled { opacity: .35; cursor: not-allowed; }
+  .riga { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .riga > * { flex: 1; min-width: 70px; }
+  .lista { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow: auto; }
+  .lista li { padding: 6px 4px; border-bottom: 1px dashed rgba(255,255,255,.12); display: flex; justify-content: space-between; gap: 8px; }
+  .lista li.io { color: var(--accent2); }
+  .msg { padding: 6px 4px; border-bottom: 1px dashed rgba(255,255,255,.12); }
+  .msg.admin { color: var(--accent2); }
+  .esito { min-height: 22px; margin-top: 8px; font-weight: bold; }
+  .esito.err { color: var(--rosso); } .esito.ok { color: var(--accent); }
+  .punto { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #555; margin-right: 6px; }
+  .punto.on { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  #login { max-width: 420px; margin: 40px auto; }
+  #banner { display: none; padding: 12px 16px; background: var(--accent); color: var(--bg1); font-weight: bold; text-align: center; font-size: 18px; position: sticky; top: 54px; z-index: 4; }
+  #conto { display: none; position: fixed; inset: 0; z-index: 20; align-items: center; justify-content: center; font-size: 38vw;
+           font-weight: bold; color: var(--accent); background: rgba(0,0,0,.55); text-shadow: 0 0 40px var(--accent); pointer-events: none; }
+  .tag { font-size: 11px; border: 1px solid var(--accent2); color: var(--accent2); padding: 1px 5px; margin-left: 6px; }
+  .nascosto { display: none !important; }
+</style>
+</head>
+<body data-tema="verde">
+<header>
+  <h1>&gt; FANTAMUSICA // ASTA LIVE_</h1>
+  <span id="chi" class="dim"></span>
+  <span class="temi">
+    <button style="background:#40ff80" data-t="verde" title="Verde"></button><button style="background:#33bfff" data-t="blu" title="Blu"></button><button style="background:#ff8c1f" data-t="arancio" title="Arancio"></button>
+  </span>
+  <button class="n nascosto" id="esci">Esci</button>
+</header>
+<div id="banner"></div>
+<div id="conto"></div>
+
+<div id="login" class="card">
+  <h2>Accesso</h2>
+  <p class="dim">Scrivi il codice personale che ti ha dato l'admin.</p>
+  <input id="codice" placeholder="CODICE" autocomplete="off" autocapitalize="characters">
+  <div class="riga"><button class="n" id="entra">Entra</button></div>
+  <div class="esito err" id="loginerr"></div>
+</div>
+
+<main id="app" class="griglia nascosto">
+  <section>
+    <div class="card">
+      <h2>In asta</h2>
+      <div class="grande" id="musicista">Nessuna asta aperta</div>
+      <div id="miglior" class="dim" style="margin-top:6px"></div>
+      <div id="miei" class="dim" style="margin-top:6px"></div>
+      <div id="controlli" class="nascosto">
+        <div class="riga" id="rapidi"></div>
+        <div class="riga"><input id="importo" type="number" inputmode="numeric" min="1" placeholder="Importo"><button class="n" id="rilancia">Rilancia</button></div>
+      </div>
+      <div class="esito" id="esito"></div>
+    </div>
+    <div class="card" style="margin-top:14px"><h2>Offerte</h2><ul class="lista" id="offerte"></ul></div>
+  </section>
+  <section>
+    <div class="card"><h2>Canale dell'asta</h2><div class="lista" id="messaggi"></div></div>
+    <div class="card" style="margin-top:14px"><h2>Squadre <span class="dim" id="nonline"></span></h2><ul class="lista" id="squadre" style="max-height:none"></ul></div>
+  </section>
+  <section class="card"><h2>Musicisti disponibili</h2><ul class="lista" id="liberi"></ul></section>
+  <section class="card"><h2>Musicisti assegnati</h2><ul class="lista" id="assegnati"></ul></section>
+</main>
+
+<script>
+const SUPABASE_URL = "https://dyzvtfprezdhfnxiwlez.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR5enZ0ZnByZXpkaGZueGl3bGV6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI5NjMyNTEsImV4cCI6MjEwODUzOTI1MX0.8msl-_xHx6pHerPA4oWsI15cQgCVnvwPv5cY8pzJwHU";
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const $ = s => document.querySelector(s);
+function el(tag, cls, testo) { const e = document.createElement(tag); if (cls) e.className = cls; if (testo !== undefined) e.textContent = testo; return e; }
+
+let io = null;          // {codice, nome, ruolo}
+let stato = { corr: null, squadre: [], musicisti: [] };
+let ultimoMsg = null, bannerT = null, contoT = null, occupato = false, canale = null, timers = [];
+
+// ---------- tema ----------
+function tema(t) { document.body.dataset.tema = t; try { localStorage.setItem("fm_tema", t); } catch (e) {} }
+document.querySelectorAll(".temi button").forEach(b => b.onclick = () => tema(b.dataset.t));
+try { tema(localStorage.getItem("fm_tema") || "verde"); } catch (e) {}
+
+// ---------- suono ----------
+function beep(freq, ms) {
+  try {
+    const c = beep.c || (beep.c = new (window.AudioContext || window.webkitAudioContext)());
+    if (c.state === "suspended") c.resume();
+    const o = c.createOscillator(), g = c.createGain();
+    o.frequency.value = freq; g.gain.value = 0.06; o.connect(g); g.connect(c.destination);
+    o.start(); o.stop(c.currentTime + ms / 1000);
+  } catch (e) {}
+}
+
+// ---------- accesso ----------
+async function entra(codice) {
+  $("#loginerr").textContent = "";
+  const { data, error } = await sb.rpc("asta_login", { p_codice: codice });
+  if (error) { $("#loginerr").textContent = "Errore di connessione: " + error.message; return false; }
+  if (!data.ok) { $("#loginerr").textContent = data.errore || "Codice non valido"; return false; }
+  io = { codice: codice, nome: data.nome, ruolo: data.ruolo };
+  try { localStorage.setItem("fm_codice", codice); } catch (e) {}
+  avvia();
+  return true;
+}
+$("#entra").onclick = () => { beep(660, 80); entra($("#codice").value.trim()); };
+$("#codice").addEventListener("keydown", e => { if (e.key === "Enter") $("#entra").click(); });
+$("#esci").onclick = () => { try { localStorage.removeItem("fm_codice"); } catch (e) {} location.reload(); };
+
+function avvia() {
+  $("#login").classList.add("nascosto");
+  $("#app").classList.remove("nascosto");
+  $("#esci").classList.remove("nascosto");
+  $("#chi").textContent = io.ruolo === "admin" ? "Osservatore (admin)" : "Giocatore: " + io.nome;
+  $("#controlli").classList.toggle("nascosto", io.ruolo === "admin");
+  refresh();
+  canale = sb.channel("asta-live");
+  ["asta_corrente", "asta_offerte", "asta_messaggi", "asta_squadre", "asta_musicisti"].forEach(t =>
+    canale.on("postgres_changes", { event: "*", schema: "public", table: t }, () => refresh()));
+  canale.subscribe();
+  timers.push(setInterval(refresh, 4000));                       // rete di sicurezza se il realtime non arriva
+  if (io.ruolo !== "admin") {
+    const ping = () => sb.rpc("asta_ping", { p_codice: io.codice });
+    ping(); timers.push(setInterval(ping, 10000));
+  }
+}
+
+// ---------- dati ----------
+async function refresh() {
+  if (!io || occupato) return;
+  occupato = true;
+  try {
+    const corr = (await sb.from("asta_corrente").select("*").eq("id", 1).single()).data;
+    const [off, msg, sq, mu] = await Promise.all([
+      corr && corr.musicista_id != null
+        ? sb.from("asta_offerte").select("*").eq("musicista_id", corr.musicista_id).order("id", { ascending: false }).limit(30)
+        : Promise.resolve({ data: [] }),
+      sb.from("asta_messaggi").select("*").order("id", { ascending: false }).limit(40),
+      sb.from("asta_squadre").select("*").order("nome"),
+      sb.from("asta_musicisti").select("*").order("nome"),
+    ]);
+    stato = { corr: corr, offerte: off.data || [], messaggi: msg.data || [], squadre: sq.data || [], musicisti: mu.data || [] };
+    disegna();
+  } catch (e) {
+    $("#esito").className = "esito err"; $("#esito").textContent = "Connessione: " + (e.message || e);
+  } finally { occupato = false; }
+}
+
+function io_squadra() { return stato.squadre.find(s => s.nome === io.nome); }
+function limiti() {
+  const c = stato.corr, s = io_squadra();
+  const min = c && c.miglior_importo != null ? c.miglior_importo + c.rilancio_min : 1;
+  const max = s ? s.crediti - (s.posti - 1) : 0;
+  return { min, max };
+}
+
+function disegna() {
+  const c = stato.corr || {};
+  $("#musicista").textContent = c.aperta ? c.musicista : "Nessuna asta aperta";
+  $("#miglior").textContent = c.aperta
+    ? (c.miglior_importo != null ? `Miglior offerta: ${c.miglior_importo} crediti di ${c.miglior_offerente}` : "Nessuna offerta (base 1 credito)") +
+      ` - rilancio minimo ${c.rilancio_min}`
+    : (c.musicista ? "Ultima asta: " + c.musicista : "");
+  const s = io_squadra();
+  $("#miei").textContent = s ? `I tuoi crediti: ${s.crediti} - posti liberi: ${s.posti}` : "";
+
+  if (io.ruolo !== "admin") {
+    const { min, max } = limiti();
+    const sono_primo = c.aperta && c.miglior_offerente === io.nome;
+    const attivo = c.aperta && !sono_primo && s && s.posti > 0 && max >= min;
+    $("#rilancia").disabled = !attivo;
+    $("#importo").placeholder = attivo ? `da ${min} a ${max}` : "Importo";
+    const r = $("#rapidi"); r.innerHTML = "";
+    [min, min + 4, min + 9].forEach(v => {
+      const b = el("button", "n", String(v)); b.disabled = !attivo || v > max;
+      b.onclick = () => rilancia(v); r.appendChild(b);
+    });
+    if (sono_primo) { $("#esito").className = "esito ok"; $("#esito").textContent = "Sei il miglior offerente!"; }
+  }
+
+  const off = $("#offerte"); off.innerHTML = "";
+  if (!stato.offerte.length) off.appendChild(el("li", "dim", "Nessuna offerta"));
+  stato.offerte.forEach(o => {
+    const li = el("li", o.giocatore === io.nome ? "io" : "");
+    li.appendChild(el("span", "", o.giocatore)); li.appendChild(el("span", "", o.importo + " cr."));
+    off.appendChild(li);
+  });
+
+  const ms = $("#messaggi"); ms.innerHTML = "";
+  stato.messaggi.forEach(m => ms.appendChild(el("div", "msg admin", m.testo)));
+  const ultimo = stato.messaggi[0];
+  if (ultimo) {
+    if (ultimoMsg !== null && ultimo.id > ultimoMsg) nuovoMessaggio(ultimo.testo);
+    ultimoMsg = ultimo.id;
+  } else if (ultimoMsg === null) ultimoMsg = 0;
+
+  const sq = $("#squadre"); sq.innerHTML = "";
+  let on = 0;
+  stato.squadre.forEach(t => {
+    const online = t.visto && (Date.now() - Date.parse(t.visto)) < 30000;
+    if (online) on++;
+    const li = el("li", t.nome === io.nome ? "io" : "");
+    const sx = el("span"); sx.appendChild(el("span", "punto" + (online ? " on" : ""))); sx.appendChild(document.createTextNode(t.nome));
+    const mie = stato.musicisti.filter(m => m.proprietario === t.nome).map(m => m.nome);
+    li.appendChild(sx); li.appendChild(el("span", "dim", `${t.crediti} cr. - ${t.posti} posti`));
+    sq.appendChild(li);
+    if (mie.length) sq.appendChild(el("li", "dim", "   " + mie.join(", ")));
+  });
+  $("#nonline").textContent = `(${on} collegati)`;
+
+  const li1 = $("#liberi"); li1.innerHTML = "";
+  const li2 = $("#assegnati"); li2.innerHTML = "";
+  stato.musicisti.forEach(m => {
+    if (m.proprietario) {
+      const li = el("li"); li.appendChild(el("span", "", m.nome)); li.appendChild(el("span", "dim", `${m.proprietario} - ${m.prezzo} cr.`)); li2.appendChild(li);
+    } else {
+      const li = el("li"); li.appendChild(el("span", "", m.nome));
+      if (c.aperta && c.musicista_id === m.id) li.appendChild(el("span", "tag", "IN ASTA"));
+      li1.appendChild(li);
+    }
+  });
+  if (!li1.children.length) li1.appendChild(el("li", "dim", "Nessuno"));
+  if (!li2.children.length) li2.appendChild(el("li", "dim", "Nessuno"));
+}
+
+function nuovoMessaggio(testo) {
+  if (/^\d{1,3}$/.test(testo.trim())) {            // conto alla rovescia: numero gigante
+    const c = $("#conto"); c.textContent = testo.trim(); c.style.display = "flex";
+    clearTimeout(contoT); contoT = setTimeout(() => c.style.display = "none", 900);
+    beep(1000, 150);
+    return;
+  }
+  const b = $("#banner"); b.textContent = testo; b.style.display = "block";
+  clearTimeout(bannerT); bannerT = setTimeout(() => b.style.display = "none", 8000);
+  beep(740, 200);
+}
+
+// ---------- rilancio ----------
+async function rilancia(importo) {
+  const esito = $("#esito");
+  esito.className = "esito"; esito.textContent = "...";
+  const { data, error } = await sb.rpc("asta_rilancia", { p_codice: io.codice, p_importo: importo });
+  if (error) { esito.className = "esito err"; esito.textContent = "Errore: " + error.message; return; }
+  if (!data.ok) { esito.className = "esito err"; esito.textContent = data.errore; beep(200, 250); return; }
+  esito.className = "esito ok"; esito.textContent = "Offerta di " + importo + " inviata";
+  $("#importo").value = "";
+  refresh();
+}
+$("#rilancia").onclick = () => {
+  const v = parseInt($("#importo").value, 10);
+  if (isNaN(v)) { $("#esito").className = "esito err"; $("#esito").textContent = "Scrivi un importo"; return; }
+  rilancia(v);
+};
+$("#importo").addEventListener("keydown", e => { if (e.key === "Enter") $("#rilancia").click(); });
+
+// ---------- accesso automatico ----------
+try { const salvato = localStorage.getItem("fm_codice"); if (salvato) { $("#codice").value = salvato; entra(salvato); } } catch (e) {}
+</script>
+</body>
+</html>
