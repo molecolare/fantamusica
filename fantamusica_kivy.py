@@ -24,6 +24,7 @@ lo stato del gioco su Supabase e applica le richieste dei giocatori che usano la
 
 Avvio:  pip install kivy pillow   ->   python3 fantamusica_kivy.py
 """
+import copy
 import json
 import os
 import re
@@ -506,7 +507,7 @@ class FantaApp(App):
         self.onl_ver = None              # ultima versione online nota
         self.onl_busy = False
         self.onl_sporco = False          # dati locali da pubblicare
-        self.onl_esiti = []              # esiti delle richieste da comunicare ai giocatori
+        self.onl_base = None             # ultima versione online nota (per unire le modifiche fatte qui)
         self.onl_testo, self.onl_err, self.onl_ultimo_errore, self.onl_fresco = "", False, "", 0
         self.imposta_tema(self.cfg.get("tema", "verde"), self.cfg.get("scanlines", False),
                           self.cfg.get("scala", 1.2))
@@ -641,20 +642,34 @@ class FantaApp(App):
         self.online_msg("● OFFLINE", True)
 
     def online_primo(self, st):
-        """Primo contatto: se online c'e' uno stato diverso da quello che questo computer ha pubblicato
-        l'ultima volta, si chiede cosa fare; altrimenti si parte pubblicando i dati locali."""
+        """Primo contatto all'avvio. Se questo computer ha la sua copia di riferimento (base) si parte da li':
+        le modifiche fatte qui (anche dal gioco da terminale) vengono unite a quelle online."""
         self.onl_busy = False
-        locale = self.cfg.get("online_versione")
-        if st.get("vuoto") or locale == st["versione"]:
-            self.onl_ver, self.onl_sporco, self.onl_stadio = st["versione"], True, "attivo"
+        if st.get("vuoto"):              # online non c'e' ancora nulla: si pubblicano i dati di questo computer
+            self.onl_ver, self.onl_base, self.onl_sporco, self.onl_stadio = None, None, True, "attivo"
             self.online_msg("● ONLINE")
+            Clock.schedule_once(self.online_tick, 0)
+            return
+        base = fo.leggi_base()
+        if base is not None:
+            self.onl_ver, self.onl_base = base
+            self.onl_sporco = fo.pulito(self.db) != fo.pulito(self.onl_base)
+            self.onl_stadio = "attivo"
+            self.online_msg("● ONLINE")
+            Clock.schedule_once(self.online_tick, 0)
+            return
+        if self.cfg.get("online_versione") == st["versione"]:
+            # versione precedente dell'app: l'ultima versione online l'aveva pubblicata questo computer
+            self.onl_ver, self.onl_base, self.onl_sporco, self.onl_stadio = st["versione"], None, True, "attivo"
+            self.online_msg("● ONLINE")
+            Clock.schedule_once(self.online_tick, 0)
             return
         quando = datetime.fromtimestamp(st["aggiornato"]).strftime("%d/%m/%Y %H:%M")
-        self.online_scelta(f"Online c'è già un salvataggio (versione {st['versione']}, del {quando}) che questo "
-                           f"computer non conosce: l'ultima versione pubblicata da qui è "
-                           f"{locale if locale is not None else 'nessuna'}.\n\nSe usi i dati di questo computer, "
-                           f"quelli online vengono sovrascritti. Se scarichi quelli online, i dati di questo computer "
-                           f"vengono sostituiti (ne viene fatto prima un backup).", st["versione"])
+        self.online_scelta(f"Online c'è un salvataggio (versione {st['versione']}, del {quando}) e questo computer "
+                           f"non sa da quale versione partono i suoi dati.\n\nDi solito conviene SCARICARE I DATI "
+                           f"ONLINE (i giocatori hanno giocato lì; prima viene fatto un backup di quelli di questo "
+                           f"computer). Se usi i dati di questo computer, quelli online vengono sovrascritti.",
+                           st["versione"])
 
     def online_scelta(self, testo, versione):
         self.onl_stadio = "scelta"
@@ -667,8 +682,9 @@ class FantaApp(App):
 
         def locali(*_):
             pop.dismiss()
-            self.onl_ver, self.onl_sporco, self.onl_stadio = versione, True, "attivo"
+            self.onl_ver, self.onl_base, self.onl_sporco, self.onl_stadio = versione, None, True, "attivo"
             self.online_msg("● ONLINE")
+            Clock.schedule_once(self.online_tick, 0)
 
         def scarica(*_):
             pop.dismiss()
@@ -678,12 +694,13 @@ class FantaApp(App):
             pop.dismiss()
             self.onl, self.onl_stadio = None, None
             self.online_msg("")
-        box.add_widget(NBtn("USA I DATI DI QUESTO COMPUTER", dim=11, height=dp(48), on_release=locali))
         box.add_widget(NBtn("SCARICA I DATI ONLINE", dim=11, height=dp(48), on_release=scarica))
+        box.add_widget(NBtn("USA I DATI DI QUESTO COMPUTER", dim=11, height=dp(48), on_release=locali))
         box.add_widget(NBtn("NON COLLEGARE ORA", dim=11, height=dp(48), colore=attenua(col("accent"), 0.7),
                             on_release=no))
 
     def online_scarica(self):
+        """Sostituisce i dati di questo computer con quelli online (prima fa un backup)."""
         if not self.onl:
             return
 
@@ -698,16 +715,15 @@ class FantaApp(App):
                 except OSError:
                     pass
                 self.db.clear()
-                self.db.update(dati)
+                self.db.update(copy.deepcopy(dati))
             else:
-                self.db = dati
+                self.db = copy.deepcopy(dati)
             fm.migra(self.db)
             assicura_campi(self.db)
             fm.salva(self.db)
-            self.cfg["online_versione"] = ver
-            scrivi_cfg(self.cfg)
-            self.onl_ver, self.onl_sporco, self.onl_stadio, self.onl_esiti = ver, False, "attivo", []
-            self.onl_busy = False
+            self.online_ricorda(ver, dati)
+            self.onl_sporco = fo.pulito(self.db) != fo.pulito(dati)
+            self.onl_stadio, self.onl_busy = "attivo", False
             self.online_msg("● ONLINE")
             self.me = self.g = None
             self.stack = [(self.v_login, ())]
@@ -720,21 +736,29 @@ class FantaApp(App):
             self.msg(f"Download non riuscito: {e}")
         in_thread(self.onl.scarica, ok, err)
 
-    def online_conflitto(self, r):
-        self.online_scelta("Mentre lavoravi, online è comparsa una versione diversa (versione "
-                           f"{r.get('versione')}): un altro computer ha pubblicato dati. Cosa vuoi fare?\n\n"
-                           "Se usi i dati di questo computer, quelli online vengono sovrascritti.",
-                           r.get("versione"))
+    def online_ricorda(self, ver, dati):
+        """Annota l'ultima versione online nota (serve per unire le modifiche): in memoria e su disco."""
+        self.onl_ver, self.onl_base = ver, dati
+        try:
+            fo.scrivi_base(ver, dati)
+        except OSError:
+            pass
+        if ver != self.cfg.get("online_versione"):
+            self.cfg["online_versione"] = ver
+            scrivi_cfg(self.cfg)
 
     def online_ritmo(self, secondi):
-        """Ritmo con cui l'app dell'admin controlla le richieste: 1 s se nell'asta online ci sono 2+ squadre, altrimenti 4 s."""
+        """Ritmo dei controlli: 1 s se nell'asta online ci sono 2+ squadre collegate, altrimenti 4 s."""
         if secondi == getattr(self, "_tick_s", 4) or getattr(self, "_tick_ev", None) is None:
             return
         self._tick_ev.cancel()
         self._tick_ev, self._tick_s = Clock.schedule_interval(self.online_tick, secondi), secondi
 
+    def popup_aperto(self):
+        return any(isinstance(w, Popup) for w in Window.children)
+
     def online_tick(self, *_):
-        """Ogni 4 secondi: prende le richieste dei giocatori, le applica, pubblica lo stato e risponde."""
+        """Ogni pochi secondi: guarda la versione online; pubblica le modifiche fatte qui oppure prende le novità."""
         if not self.onl or self.onl_busy or self.db is None:
             return
         if self.onl_stadio == "avvio":
@@ -744,93 +768,120 @@ class FantaApp(App):
         if self.onl_stadio != "attivo":
             return
         self.onl_busy = True
+        in_thread(self.onl.stato, self.online_giro, self.online_errore)
 
-        def ok(reqs):
-            if reqs:
-                esiti, cambiato = fo.elabora_richieste(self.db, reqs)
-                self.onl_esiti += esiti
-                if cambiato:
-                    self.salva()
-                    n = sum(1 for e in esiti if e["stato"] == "ok")
-                    if n:
-                        self.online_msg(f"● {n} RICHIESTE")
-                        self.onl_fresco = 2
-                    self.online_aggiorna_vista()
-            self.online_invia()
-        in_thread(self.onl.richieste, ok, self.online_errore)
-
-    def online_invia(self):
-        if not self.onl_sporco and not self.onl_esiti:
+    def online_giro(self, st):
+        if self.onl_stadio != "attivo" or self.db is None:
+            self.onl_busy = False
+            return
+        if st.get("vuoto") or st["versione"] == self.onl_ver:
+            if self.onl_sporco:
+                self.online_invia()
+                return
             self.onl_busy = False
             if self.onl_fresco > 0:
                 self.onl_fresco -= 1
             else:
                 self.online_msg("● ONLINE")
             return
-        dati = None
-        if self.onl_sporco:
-            if fo.assicura_codici(self.db):
-                fm.salva(self.db)
-            dati = fo.copia_dati(self.db)
-            self.onl_sporco = False
-        esiti, self.onl_esiti = self.onl_esiti, []
-        base = self.onl_ver
+        # online c'è una versione nuova (giocatori, admin dal telefono, un altro computer)
+        if self.popup_aperto():          # non si cambiano i dati sotto una finestra aperta
+            self.onl_busy = False
+            self.online_msg("● NOVITÀ ONLINE")
+            return
+        in_thread(self.onl.scarica, self.online_ricevi, self.online_errore)
 
-        def lavoro():
-            ver, falliti = base, None
-            if dati is not None:
-                r = self.onl.push(dati, base)
-                if r.get("conflitto"):
-                    return {"conflitto": r}
-                ver = r["versione"]
-            if esiti:
-                try:
-                    self.onl.esiti(esiti)
-                except Exception as e:
-                    falliti = str(e)
-            return {"ver": ver, "falliti": falliti}
+    def online_ricevi(self, r):
+        self.onl_busy = False
+        ver, remoto = r
+        if self.onl_stadio != "attivo" or self.db is None or self.popup_aperto():
+            return                       # ci si riprova al prossimo giro
+        if not all(k in remoto for k in fm.CHIAVI_OBBLIGATORIE):
+            self.online_errore(RuntimeError("i dati online non sembrano un database di FantaBanda"))
+            return
+        if self.onl_sporco and self.onl_base is None:
+            self.online_scelta("Online è comparsa una versione nuova mentre questo computer aveva modifiche da "
+                               "pubblicare, e non c'è una copia di riferimento per unirle.\n\nSe scarichi i dati "
+                               "online perdi le modifiche fatte qui (resta un backup); se usi i dati di questo "
+                               "computer sovrascrivi quelli online.", ver)
+            return
+        if self.onl_sporco:
+            nuovo = fo.unisci(self.onl_base, self.db, remoto)
+        else:
+            nuovo = copy.deepcopy(remoto)
+        self.online_sostituisci(nuovo)
+        self.online_ricorda(ver, remoto)
+        self.onl_sporco = fo.pulito(self.db) != fo.pulito(remoto)
+        self.online_msg("● AGGIORNATO")
+        self.onl_fresco = 2
+        if self.onl_sporco:
+            Clock.schedule_once(self.online_tick, 0)     # pubblica subito l'unione
+        self.online_aggiorna_vista()
+
+    def online_sostituisci(self, nuovo):
+        """Mette 'nuovo' al posto dei dati in memoria (stesso oggetto db) e lo salva sul disco."""
+        fm.migra(nuovo)
+        assicura_campi(nuovo)
+        self.db.clear()
+        self.db.update(nuovo)
+        fm.salva(self.db)
+        if self.me:
+            u = fm.utente(self.db, self.me["nome"])
+            if u is None:
+                self.me = self.g = None
+                self.stack = [(self.v_login, ())]
+                self.ricostruisci()
+                self.render()
+                self.msg("Il tuo utente non esiste più nei dati online.")
+                return
+            self.me = u
+            self.g = fm.Gioco(self.db, u)
+
+    def online_invia(self):
+        """Pubblica i dati di questo computer partendo dalla versione online nota (se nel frattempo è cambiata,
+        il giro successivo scarica la nuova e unisce)."""
+        if fo.assicura_codici(self.db):
+            fm.salva(self.db)
+        dati = fo.copia_dati(self.db)
+        dati.pop("richieste_applicate", None)
+        self.onl_sporco = False
+        base = self.onl_ver
 
         def ok(r):
             self.onl_busy = False
-            if "conflitto" in r:
-                self.onl_esiti = esiti + self.onl_esiti
+            if r.get("conflitto"):
                 self.onl_sporco = True
-                self.online_conflitto(r["conflitto"])
+                Clock.schedule_once(self.online_tick, 0)
                 return
-            self.onl_ver = r["ver"]
-            if r["ver"] != self.cfg.get("online_versione"):
-                self.cfg["online_versione"] = r["ver"]
-                scrivi_cfg(self.cfg)
-            if r["falliti"]:
-                self.onl_esiti = esiti + self.onl_esiti
-                self.online_errore(r["falliti"])
-            elif self.onl_fresco <= 0:
+            self.online_ricorda(r["versione"], dati)
+            if self.onl_fresco <= 0:
                 self.online_msg("● ONLINE")
 
         def err(e):
-            if dati is not None:
-                self.onl_sporco = True
-            self.onl_esiti = esiti + self.onl_esiti
+            self.onl_sporco = True
             self.online_errore(e)
-        in_thread(lavoro, ok, err)
+        in_thread(lambda: self.onl.push(dati, base), ok, err)
 
     def online_aggiorna_vista(self):
-        """Dopo aver applicato richieste, ridisegna le schermate che mostrano elenchi (se non c'è un popup aperto)."""
-        if not self.me or any(isinstance(w, Popup) for w in Window.children):
+        """Dopo aver preso le novità online, ridisegna la schermata (se non c'è un popup aperto)."""
+        if not self.me or self.popup_aperto() or not self.stack:
             return
         if self.stack[-1][0] in (self.v_pending, self.v_mercato, self.v_home, self.v_classifica):
             self.render()
 
     def on_stop(self):
-        """Alla chiusura pubblica un'ultima volta le modifiche non ancora inviate."""
+        """Alla chiusura pubblica un'ultima volta le modifiche non ancora inviate (se online nel frattempo è
+        cambiato, verranno unite al prossimo avvio)."""
         try:
             if self.onl and self.onl_sporco and self.onl_stadio == "attivo" and self.db is not None:
                 fo.assicura_codici(self.db)
+                fm.salva(self.db)
                 self.onl.timeout = 8
-                r = self.onl.push(fo.copia_dati(self.db), self.onl_ver)
+                dati = fo.copia_dati(self.db)
+                dati.pop("richieste_applicate", None)
+                r = self.onl.push(dati, self.onl_ver)
                 if r.get("ok"):
-                    self.cfg["online_versione"] = r["versione"]
-                    scrivi_cfg(self.cfg)
+                    self.online_ricorda(r["versione"], dati)
         except Exception:
             pass
 
@@ -847,7 +898,9 @@ class FantaApp(App):
             righe = [f"Stato: {self.onl_testo or 'non collegato'}",
                      f"Versione online: {self.onl_ver if self.onl_ver is not None else '-'}",
                      f"Pagina dei giocatori: {c.get('web_url') or '(scrivi l’indirizzo in web_url dentro fantamusica_online.json)'}",
-                     "Questa app applica le richieste dei giocatori ogni 4 secondi: tienila aperta durante il gioco."]
+                     "Il gioco gira online da solo: giocatori e admin (dal telefono) usano la pagina web. "
+                     "Questa app scarica le novità e pubblica le modifiche fatte qui, unendole a quelle online. "
+                     "Non serve tenerla aperta."]
             if self.onl_ultimo_errore and self.onl_err:
                 righe.append(f"Ultimo errore: {self.onl_ultimo_errore}")
             for r in righe:
@@ -2229,6 +2282,16 @@ class FantaApp(App):
         st = self.live
         if not st:
             return
+        if self.onl and self.onl_stadio == "attivo":
+            # col gioco online squadre, crediti e codici dell'asta si aggiornano da soli a ogni modifica:
+            # basta pubblicare le eventuali modifiche fatte da qui
+            self.onl_sporco = True
+            self.online_tick()
+            self.live_stato("Squadre e musicisti dell'asta seguono i dati online")
+            if mostra:
+                self.msg("Col gioco online squadre, crediti e codici dell'asta si aggiornano da soli.")
+            self.live_poll()
+            return
         sq, mu, co = self.payload_sync()
         c = st["c"]
 
@@ -2420,6 +2483,11 @@ class FantaApp(App):
                 return
             m = next((x for x in db["musicisti"] if x["id"] == r["musicista_id"]), None)
             u = fm.utente(db, r["giocatore"])
+            if m and u and m["proprietario"] == u["nome"] and m["prezzo"] == int(r["importo"]):
+                # online l'aggiudicazione e' gia' nei dati del gioco (e questo computer li ha gia' scaricati)
+                self.msg(f"AGGIUDICATO: {m['nome']} a {u['nome']} per {r['importo']} crediti.")
+                self.sostituisci(self.v_asta, "live")
+                return
             if not m or not u or m["proprietario"]:
                 self.msg("Aggiudicato online, ma non applicabile ai dati locali (musicista o giocatore non "
                          "trovato, oppure già assegnato). Controlla e premi SINCRONIZZA.")

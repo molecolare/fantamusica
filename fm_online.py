@@ -2,19 +2,23 @@
 """
 FANTABANDA - collegamento online (Supabase)
 
-Questo modulo NON ha grafica: lo usano l'app Kivy (fantamusica_kivy.py) e, se vuoi, il programma
-da terminale fantamusica_server.py. Sta accanto a fantamusica.py.
+Questo modulo NON ha grafica: lo usa l'app Kivy (fantamusica_kivy.py) e si puo' usare anche da terminale:
+
+    python3 fm_online.py sincronizza      unisce i dati di questo computer con quelli online
 
 Come funziona
-  * Il database del gioco resta sul computer dell'admin (fantamusica_dati.json) e viene
-    PUBBLICATO su Supabase a ogni modifica (push). Online ne finisce anche una copia completa,
-    leggibile solo con il codice admin, utile come backup.
-  * I giocatori, dalla pagina web, mandano RICHIESTE (proponi evento, scambi, soprannomi, voti).
-  * Il computer dell'admin le legge, le applica con le regole di fantamusica.py (elabora_richiesta)
-    e ripubblica lo stato: per questo l'app dell'admin deve restare aperta durante il gioco.
+  * Il gioco vive ONLINE (Supabase): le regole per le richieste dei giocatori e per le operazioni
+    dell'admin dalla pagina web girano dentro il database (supabase_fantabanda.sql). Nessun PC acceso.
+  * L'app Kivy (e il gioco da terminale) lavorano su una copia locale (fantamusica_dati.json):
+    l'app scarica le novita' online e pubblica le modifiche fatte da qui. Se nel frattempo qualcuno
+    ha giocato, le due versioni vengono UNITE (unisci) invece di sovrascriversi.
+  * Per unire serve l'ultima versione scaricata/pubblicata da questo computer: e' salvata in
+    fantamusica_online_base.json accanto ai dati.
 """
+import copy
 import json
 import secrets
+import sys
 import ssl
 import urllib.error
 import urllib.request
@@ -362,3 +366,241 @@ def elabora_richieste(db, richieste):
         for k in sorted(reg, key=int)[:-300]:
             del reg[k]
     return esiti, cambiato
+
+
+# --------------------------------------------------------------------------
+# Unione di due versioni del database (questo computer + online)
+# --------------------------------------------------------------------------
+BASE_FILE = fm.DATA_FILE.with_name("fantamusica_online_base.json")
+
+# liste di record: si uniscono record per record (chiave fra parentesi)
+LISTE = {"utenti": "nome", "musicisti": "id", "azioni": "id", "bonus": "id", "scambi": "id", "eventi": "id",
+         "campi": "id", "storico": "id"}
+# contatori di ID usati anche online (giocatori, admin dal telefono): gli ID nuovi creati da questo computer
+# vengono spostati dopo quelli creati online, cosi' non si scontrano
+SPOSTABILI = {"evento": [("eventi", "id")], "gruppo": [("eventi", "gruppo")], "scambio": [("scambi", "id")]}
+# contatore -> lista (e campo) da cui non deve mai restare indietro
+CONTATORI = {"evento": ("eventi", "id"), "scambio": ("scambi", "id"), "musicista": ("musicisti", "id"),
+             "azione": ("azioni", "id"), "bonus": ("bonus", "id"), "campo": ("campi", "id"),
+             "stagione": ("storico", "id"), "gruppo": ("eventi", "gruppo")}
+_MANCA = object()
+
+
+def pulito(db):
+    """Copia confrontabile del database (senza dati tecnici)."""
+    d = copia_dati(db)
+    d.pop("richieste_applicate", None)
+    return d
+
+
+def leggi_base():
+    """(versione, dati) dell'ultima versione online nota a questo computer, oppure None."""
+    try:
+        with open(BASE_FILE, encoding="utf-8") as f:
+            b = json.load(f)
+        return b["versione"], b["dati"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def scrivi_base(versione, dati):
+    tmp = BASE_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"versione": versione, "dati": dati}, f, ensure_ascii=False)
+    tmp.replace(BASE_FILE)
+
+
+def _intero_vero(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _contatore(db, tipo):
+    v = (db.get("contatori") or {}).get(tipo, 1)
+    return v if _intero_vero(v) else 1
+
+
+def _sposta_nuovi(base, locale, remoto):
+    """Se sia questo computer sia online hanno creato nuovi eventi/gruppi/scambi partendo dalla stessa base,
+    quelli di questo computer vengono rinumerati dopo quelli online."""
+    loc = copy.deepcopy(locale)
+    for tipo, campi in SPOSTABILI.items():
+        cb, cl, cr = _contatore(base, tipo), _contatore(loc, tipo), _contatore(remoto, tipo)
+        if cl > cb and cr > cb:
+            delta = cr - cb
+            for lista, campo in campi:
+                for x in loc.get(lista) or []:
+                    if isinstance(x, dict) and _intero_vero(x.get(campo)) and x[campo] >= cb:
+                        x[campo] += delta
+            loc.setdefault("contatori", {})[tipo] = cl + delta
+    return loc
+
+
+def _valore(b, l, r):
+    if l == r:
+        return copy.deepcopy(l)
+    if b is not _MANCA and l == b:
+        return copy.deepcopy(r)
+    if b is not _MANCA and r == b:
+        return copy.deepcopy(l)
+    if isinstance(l, dict) and isinstance(r, dict):
+        return _dizionario(b if isinstance(b, dict) else {}, l, r)
+    return copy.deepcopy(l)          # cambiato in tutti e due i posti: vince questo computer (l'admin)
+
+
+def _scegli(b, l, r):
+    """Unione di un elemento (chiave di un dizionario o record di una lista). _MANCA = non c'e'."""
+    if l is _MANCA and r is _MANCA:
+        return _MANCA
+    if l is _MANCA:          # non c'e' qui: aggiunto online (si tiene) oppure tolto qui (vince la rimozione)
+        return copy.deepcopy(r) if b is _MANCA else _MANCA
+    if r is _MANCA:          # non c'e' online: tolto online (se qui non e' cambiato) oppure aggiunto/cambiato qui
+        return _MANCA if (b is not _MANCA and l == b) else copy.deepcopy(l)
+    return _valore(b, l, r)
+
+
+def _dizionario(b, l, r):
+    out = {}
+    for k in list(r) + [k for k in l if k not in r]:
+        v = _scegli(b.get(k, _MANCA), l.get(k, _MANCA), r.get(k, _MANCA))
+        if v is not _MANCA:
+            out[k] = v
+    return out
+
+
+def _lista(b, l, r, chiave):
+    tutti = (b or []) + (l or []) + (r or [])
+    if not all(isinstance(x, dict) and chiave in x for x in tutti):
+        return _valore(b, l, r)
+    mappe = []
+    for lst in (b or [], l or [], r or []):
+        m = {}
+        for x in lst:
+            if x[chiave] in m:                     # chiavi doppie: non si puo' unire record per record
+                return _valore(b, l, r)
+            m[x[chiave]] = x
+        mappe.append(m)
+    mb, ml, mr = mappe
+    ordine = [x[chiave] for x in r] + [x[chiave] for x in l if x[chiave] not in mr]
+    out = []
+    for k in ordine:
+        v = _scegli(mb.get(k, _MANCA), ml.get(k, _MANCA), mr.get(k, _MANCA))
+        if v is not _MANCA:
+            out.append(v)
+    return out
+
+
+def unisci(base, locale, remoto):
+    """Unione a tre vie: 'base' e' l'ultima versione online che questo computer conosceva, 'locale' quella
+    modificata qui, 'remoto' quella online attuale. Le modifiche fatte da una parte sola passano tutte;
+    se lo stesso dato e' cambiato in tutti e due i posti vince questo computer."""
+    base, remoto = pulito(base), pulito(remoto)
+    loc = _sposta_nuovi(base, pulito(locale), remoto)
+    out = {}
+    for k in list(remoto) + [k for k in loc if k not in remoto]:
+        b, l, r = base.get(k, _MANCA), loc.get(k, _MANCA), remoto.get(k, _MANCA)
+        if k in LISTE and isinstance(l, list) and isinstance(r, list):
+            v = _lista(b if isinstance(b, list) else [], l, r, LISTE[k])
+        elif k == "contatori" and isinstance(l, dict) and isinstance(r, dict):
+            bb = b if isinstance(b, dict) else {}
+            v = {}
+            for t in list(r) + [t for t in l if t not in r]:
+                lv, rv, bv = l.get(t), r.get(t), bb.get(t)
+                if lv is None or rv is None:
+                    v[t] = rv if lv is None else lv
+                elif lv == bv:
+                    v[t] = rv
+                elif rv == bv:
+                    v[t] = lv
+                else:
+                    v[t] = max(lv, rv)
+        else:
+            v = _scegli(b, l, r)
+        if v is not _MANCA:
+            out[k] = v
+    cont = out.setdefault("contatori", {})
+    for tipo, (lista, campo) in CONTATORI.items():
+        ids = [x.get(campo) for x in out.get(lista) or [] if isinstance(x, dict) and _intero_vero(x.get(campo))]
+        if ids and _contatore(out, tipo) <= max(ids):
+            cont[tipo] = max(ids) + 1
+    return out
+
+
+# --------------------------------------------------------------------------
+# Sincronizzazione da terminale (senza l'app): python3 fm_online.py sincronizza
+# --------------------------------------------------------------------------
+def sincronizza(cfg, db, scelta=None):
+    """Porta online le modifiche fatte su questo computer e scarica le novita'. Ritorna (db, messaggio).
+    scelta: None (automatico), 'locali' (sovrascrive online), 'online' (sostituisce i dati locali)."""
+    on = Online(cfg)
+    st = on.stato()
+    base = leggi_base()
+    if st.get("vuoto") or scelta == "locali":
+        assicura_codici(db)
+        r = on.push(copia_dati(db), None if st.get("vuoto") else st["versione"])
+        if r.get("conflitto"):
+            raise ErroreOnline("Online e' cambiato proprio adesso: riprova")
+        scrivi_base(r["versione"], copia_dati(db))
+        return db, f"Dati di questo computer pubblicati (versione {r['versione']})."
+    if scelta == "online" or base is None:
+        if scelta is None:
+            raise ErroreOnline("Questo computer non ha ancora una copia di riferimento dei dati online. Scegli:\n"
+                               "  python3 fm_online.py sincronizza locali   (pubblica i dati di qui)\n"
+                               "  python3 fm_online.py sincronizza online   (scarica quelli online, con backup)")
+        ver, dati = on.scarica()
+        if db is not None:
+            fm.crea_backup(db, "prima-del-download-online")
+        scrivi_base(ver, dati)
+        return copy.deepcopy(dati), f"Scaricati i dati online (versione {ver})."
+    for _ in range(5):
+        ver_b, dati_b = base
+        cambiato_qui = pulito(db) != pulito(dati_b)
+        if st["versione"] == ver_b and not cambiato_qui:
+            return db, "Già sincronizzato: nessuna modifica."
+        if st["versione"] == ver_b:
+            nuovo = pulito(db)
+        else:
+            ver, remoto = on.scarica()
+            nuovo = unisci(dati_b, db, remoto) if cambiato_qui else pulito(remoto)
+            base = (ver, remoto)
+            scrivi_base(ver, remoto)
+            if nuovo == pulito(remoto):
+                return nuovo, f"Scaricate le novità online (versione {ver})."
+        assicura_codici(nuovo)
+        r = on.push(copia_dati(nuovo), base[0])
+        if r.get("conflitto"):
+            st = on.stato()
+            db = nuovo
+            continue
+        scrivi_base(r["versione"], copia_dati(nuovo))
+        return nuovo, f"Modifiche di questo computer unite e pubblicate (versione {r['versione']})."
+    raise ErroreOnline("Online i dati cambiano troppo spesso in questo momento: riprova tra poco")
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] != "sincronizza":
+        print(__doc__)
+        return 1
+    scelta = argv[2] if len(argv) > 2 and argv[2] in ("locali", "online") else None
+    try:
+        with open(fm.DATA_FILE.with_name("fantamusica_online.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        print("Manca fantamusica_online.json accanto ai dati.")
+        return 1
+    db = fm.carica()
+    if db is None and scelta != "online":
+        print("Su questo computer non ci sono dati: usa 'python3 fm_online.py sincronizza online'.")
+        return 1
+    try:
+        nuovo, msg = sincronizza(cfg, db, scelta)
+    except ErroreOnline as e:
+        print(e)
+        return 1
+    fm.migra(nuovo)
+    fm.salva(nuovo)
+    print(msg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
