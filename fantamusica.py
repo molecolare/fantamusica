@@ -62,7 +62,7 @@ import json
 import math
 import os
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
 
@@ -97,13 +97,14 @@ SINGOLARI = {"minuti": "minuto", "ore": "ora", "giorni": "giorno", "secondi": "s
              "settimane": "settimana", "mesi": "mese", "anni": "anno"}
 RANGE_PREDEFINITO = "1-10"
 SCAMBI_PREDEFINITI = 3
+PERIODO_PREDEFINITO = "30g"     # periodo mostrato negli elenchi eventi finche' non si sceglie altro
 
 # Preferenze personali di ogni giocatore (salvate nel suo profilo e caricate al login)
 PREF_BASE = {
     "soprannome": "",          # mostrato nel saluto e nella classifica
     "soprannomi_musicisti": {},  # soprannomi personali dei musicisti: {id musicista: soprannome}
     "riepilogo_login": True,   # riepilogo all'accesso (posizione, novità, pending)
-    "righe_eventi": 15,        # quanti eventi mostrare negli elenchi (0 = tutti)
+    "periodo_eventi": PERIODO_PREDEFINITO,   # quanto indietro guardare negli elenchi (vedi PERIODI_EVENTI)
     "ordinamenti": {},         # ultimo ordinamento scelto per ogni elenco: {lista: [colonna, decrescente]}
     "ultimo_accesso": None,
 }
@@ -191,7 +192,9 @@ def migra(db):
         imposta(u, "recupero", None)
         if "preferenze" not in u:
             cambiato = True
-        prefs(u)
+        p = prefs(u)
+        if p.pop("righe_eventi", None) is not None:   # sostituita dal periodo (PERIODI_EVENTI)
+            cambiato = True
     for m in db["musicisti"]:
         imposta(m, "profilo", {})
         imposta(m, "soprannome", "")
@@ -407,8 +410,88 @@ def gruppo_voto(db, e, lista=None):
     return trovati or [e]
 
 
+def indice_gruppi(db):
+    """{numero di gruppo: righe dell'evento, in ordine di registrazione}. Si calcola una volta sola
+    prima di disegnare un elenco, per non riscorrere tutti gli eventi a ogni riga."""
+    idx = {}
+    for e in db["eventi"]:
+        if e.get("gruppo"):
+            idx.setdefault(e["gruppo"], []).append(e)
+    for righe in idx.values():
+        righe.sort(key=lambda x: x["id"])
+    return idx
+
+
+def gruppo_evento(db, e, lista=None, idx=None):
+    """Tutte le righe che compongono lo stesso evento registrato (ruoli previsti dall'azione + altri
+    coinvolti), in ordine di registrazione. Un evento con un solo musicista sta da solo.
+    Con idx (da indice_gruppi) evita la scansione."""
+    if not e.get("gruppo"):
+        return [e]
+    if idx is not None:
+        return idx.get(e["gruppo"]) or [e]
+    lista = db["eventi"] if lista is None else lista
+    trovati = sorted((x for x in lista if x.get("gruppo") == e["gruppo"]), key=lambda x: x["id"])
+    return trovati or [e]
+
+
+def comprimi_gruppi(eventi):
+    """Per elenchi piu' snelli: una sola riga per evento registrato, quella del musicista principale
+    (la prima registrata). Mantiene l'ordine dell'elenco di partenza."""
+    principali = {}
+    for e in eventi:
+        g = e.get("gruppo")
+        if g and (g not in principali or e["id"] < principali[g]["id"]):
+            principali[g] = e
+    out, visti = [], set()
+    for e in eventi:
+        g = e.get("gruppo")
+        if not g:
+            out.append(e)
+        elif g not in visti:
+            visti.add(g)
+            out.append(principali[g])
+    return out
+
+
+def etichetta_ruolo(e):
+    """Il ruolo di una riga dell'evento, come si legge nei dettagli ('extra' = altro coinvolto)."""
+    r = e.get("ruolo") or ""
+    return "altro coinvolto" if r == "extra" else r
+
+
+def quanti_coinvolti(db, e, lista=None, idx=None):
+    """Quanti altri musicisti condividono l'evento con e (0 = evento di un solo musicista)."""
+    return len(gruppo_evento(db, e, lista, idx)) - 1
+
+
+def descrivi_coinvolti(db, e, lista=None, idx=None):
+    """'+2 coinvolti' per la riga di elenco di un evento di gruppo (vuoto se l'evento e' di un solo
+    musicista), con il numero di righe ancora in pending se ce ne sono."""
+    altri = [x for x in gruppo_evento(db, e, lista, idx) if x["id"] != e["id"]]
+    if not altri:
+        return ""
+    pend = sum(1 for x in altri if x.get("stato", "ok") == "pending")
+    return f"+{len(altri)} coinvolt{'o' if len(altri) == 1 else 'i'}" + (f", {pend} in pending" if pend else "")
+
+
 def eventi_pending(db):
     return [e for e in db["eventi"] if e.get("stato", "ok") == "pending"]
+
+
+def totali_punti(db):
+    """Somma i punti di tutti gli eventi validi in una sola passata. Ritorna tre dizionari:
+    {id musicista: punti}, {nome giocatore: punti}, {(id musicista, nome giocatore): punti}.
+    Serve alle classifiche, che altrimenti riscorrerebbero tutti gli eventi per ogni riga."""
+    mus, uten, coppie = {}, {}, {}
+    for e in eventi_ok(db):
+        p = e["punti"]
+        mid, prop = e["musicista_id"], e["proprietario"]
+        mus[mid] = mus.get(mid, 0) + p
+        if prop:
+            uten[prop] = uten.get(prop, 0) + p
+            coppie[(mid, prop)] = coppie.get((mid, prop), 0) + p
+    return mus, uten, coppie
 
 
 def punti_musicista(db, mid, proprietario=None):
@@ -430,16 +513,66 @@ def posizioni(valori):
 
 
 def classifica_giocatori(db):
-    dati = sorted(((u["nome"], punti_utente(db, u["nome"])) for u in giocatori(db)),
+    _, uten, _ = totali_punti(db)
+    dati = sorted(((u["nome"], uten.get(u["nome"], 0)) for u in giocatori(db)),
                   key=lambda x: (-x[1], x[0].lower()))
     pos = posizioni([p for _, p in dati])
     return [(ps, n, p) for ps, (n, p) in zip(pos, dati)]
 
 
-def eventi_recenti(db, n, filtro=None):
-    """Gli ultimi n eventi (n = 0: tutti), il più recente per primo, ordinati per data."""
+def classifica_musicisti(db):
+    """[(pos, musicista, punti)] dal piu' forte; a parita' di punti in ordine alfabetico."""
+    mus, _, _ = totali_punti(db)
+    dati = sorted(((m, mus.get(m["id"], 0)) for m in db["musicisti"]),
+                  key=lambda x: (-x[1], x[0]["nome"].lower()))
+    pos = posizioni([p for _, p in dati])
+    return [(ps, m, p) for ps, (m, p) in zip(pos, dati)]
+
+
+# Periodi scegliibili negli elenchi eventi: (codice salvato nelle preferenze, etichetta)
+PERIODI_EVENTI = [("1h", "ultim'ora"), ("3g", "ultimi 3 giorni"), ("7g", "ultima settimana"),
+                  ("30g", "ultimo mese"), ("90g", "ultimi 3 mesi"), ("tutto", "tutta la stagione")]
+
+
+def etichetta_periodo(periodo):
+    return dict(PERIODI_EVENTI).get(periodo, dict(PERIODI_EVENTI)[PERIODO_PREDEFINITO])
+
+
+def inizio_periodo(periodo, adesso=None):
+    """Data-ora da cui parte il periodo, nello stesso formato delle date degli eventi
+    ('AAAA-MM-GG hh:mm', quindi confrontabile come testo). None = nessun limite."""
+    if not periodo or periodo == "tutto":
+        return None
+    try:
+        quanti, unita = int(periodo[:-1]), periodo[-1]
+    except ValueError:
+        return None
+    if unita not in ("h", "g"):
+        return None
+    delta = timedelta(hours=quanti) if unita == "h" else timedelta(days=quanti)
+    return ((adesso or datetime.now()) - delta).strftime("%Y-%m-%d %H:%M")
+
+
+def filtro_periodo(periodo, adesso=None):
+    """Filtro da passare a eventi_recenti: tiene solo gli eventi dentro il periodo. None = tutti."""
+    da = inizio_periodo(periodo, adesso)
+    if da is None:
+        return None
+    return lambda e: (e.get("data_completamento") or e["data"]) >= da
+
+
+def eventi_periodo(db, periodo, comprimi=True, adesso=None):
+    """Gli eventi del periodo scelto, dal piu' recente, una riga per evento (vedi comprimi_gruppi)."""
+    return eventi_recenti(db, 0, filtro_periodo(periodo, adesso), comprimi)
+
+
+def eventi_recenti(db, n, filtro=None, comprimi=False):
+    """Gli ultimi n eventi (n = 0: tutti), il più recente per primo, ordinati per data. Con comprimi=True
+    un evento che coinvolge più musicisti conta come uno solo (resta la riga del musicista principale)."""
     ev = [e for e in db["eventi"] if (filtro is None or filtro(e))]
     ev.sort(key=lambda e: (e.get("data_completamento") or e["data"], e["id"]), reverse=True)
+    if comprimi:
+        ev = comprimi_gruppi(ev)
     return ev[:n] if n else ev
 
 
@@ -633,7 +766,10 @@ def descrivi_punteggio(a):
     return " | ".join(f"{s['ruolo']}: {descrivi_slot(a, s)}" for s in slot)
 
 
-def descrivi_calcolo(e):
+def descrivi_calcolo(e, breve=False, con_ruolo=True):
+    """Come si e' arrivati al punteggio. Con breve=True omette il numero di gruppo (che negli elenchi
+    e' rumore: la riga gialla e la finestra dei dettagli dicono gia' chi altro e' coinvolto).
+    Con con_ruolo=False omette anche il ruolo, perche' nei dettagli e' gia' scritto accanto al nome."""
     parti = []
     if e.get("dittatura"):
         parti.append("DITTATURA")
@@ -644,9 +780,9 @@ def descrivi_calcolo(e):
             parti.append(f"base {e['base']}")
         parti.extend(descrivi_bonus(b) for b in e.get("bonus", []))
         parti.extend(descrivi_bonus(b) for b in e.get("bonus_auto", []))
-    if e.get("ruolo"):
-        parti.append(f"ruolo {e['ruolo']}")
-    if e.get("gruppo"):
+    if e.get("ruolo") and con_ruolo:
+        parti.append("altro coinvolto" if e["ruolo"] == "extra" else f"ruolo {e['ruolo']}")
+    if e.get("gruppo") and not breve:
         parti.append(f"gruppo {e['gruppo']}")
     return "; ".join(parti)
 
@@ -798,11 +934,9 @@ def righe_csv(db):
         u = utente(db, nome)
         gio.append([pos, nome, prefs(u)["soprannome"], punti, crediti(db, nome),
                     ", ".join(m["nome"] for m in rosa(db, nome))] + car(u, cgio))
-    dati = sorted(((m, punti_musicista(db, m["id"])) for m in db["musicisti"]),
-                  key=lambda x: (-x[1], x[0]["nome"].lower()))
     mus = [[ps, m["nome"], m.get("soprannome", ""), m["proprietario"] or "", m["prezzo"] if m["proprietario"] else "",
             p] + car(m, cmus)
-           for ps, (m, p) in zip(posizioni([p for _, p in dati]), dati)]
+           for ps, m, p in classifica_musicisti(db)]
     nomi = {m["id"]: m["nome"] for m in db["musicisti"]}
     ev = [[e["id"], e["data"], e["stato"], nomi.get(e["musicista_id"], "?"), e["azione"], e.get("ruolo", ""),
            e["punti"], "" if e.get("base") is None else e["base"],
@@ -1140,12 +1274,13 @@ class Gioco:
 
     def colonne_musicisti(self, campi=False):
         db = self.db
+        tot_mus = totali_punti(db)[0]       # calcolati una volta sola, non per ogni riga
         cols = [Col("id", "ID", lambda m: m["id"], ">"),
                 Col("nome", "Musicista", lambda m: m["nome"]),
                 self.col_soprannome(), self.col_mio_soprannome(),
                 Col("squadra", "Squadra", lambda m: m["proprietario"]),
                 Col("prezzo", "Prezzo", lambda m: m["prezzo"] if m["proprietario"] else None, ">"),
-                Col("punti", "Punti", lambda m: punti_musicista(db, m["id"]), ">")]
+                Col("punti", "Punti", lambda m: tot_mus.get(m["id"], 0), ">")]
         if campi:
             cols += self.colonne_campi("musicisti", lambda m: m)
         return cols
@@ -1167,25 +1302,31 @@ class Gioco:
 
     def colonne_eventi(self):
         db = self.db
+        idx = indice_gruppi(db)          # una volta sola, non per ogni riga
 
         def punti_txt(v, e):
             if e.get("stato") == "pending":
                 return "PENDING"
             return f"{v:+d}" + ("*" if e.get("dittatura") else "")
+
+        def musicista_txt(v, e):
+            """Accanto al musicista principale, '+2' se l'evento ne coinvolge altri due."""
+            n = quanti_coinvolti(db, e, idx=idx)
+            return v + (f" (+{n})" if n > 0 else "")
         return [Col("id", "ID", lambda e: e["id"], ">"),
                 Col("data", "Data", lambda e: e.get("data_completamento") or e["data"]),
-                Col("musicista", "Musicista", lambda e: nome_musicista(db, e["musicista_id"])),
+                Col("musicista", "Musicista", lambda e: nome_musicista(db, e["musicista_id"]), fmt=musicista_txt),
                 Col("azione", "Azione", lambda e: e["azione"]),
                 Col("punti", "Punti", lambda e: e["punti"], ">", fmt=punti_txt,
                     ordine=lambda e: e["punti"] if e.get("stato") != "pending" else None),
                 Col("squadra", "Squadra", lambda e: e["proprietario"]),
-                Col("calcolo", "Calcolo", descrivi_calcolo, ordinabile=False)]
+                Col("calcolo", "Calcolo", lambda e: descrivi_calcolo(e, breve=True), ordinabile=False)]
 
     def mostra_eventi(self, eventi, lid="eventi"):
         self.stampa(lid, self.colonne_eventi(), eventi, ("data", True))
 
     def mostra_ultimi_eventi(self):
-        self.mostra_eventi(eventi_recenti(self.db, prefs(self.me)["righe_eventi"]))
+        self.mostra_eventi(eventi_periodo(self.db, prefs(self.me)["periodo_eventi"]))
 
     def mostra_pending(self):
         self.mostra_eventi(eventi_pending(self.db), "pending")
@@ -1283,10 +1424,7 @@ class Gioco:
             print("Nessun musicista.")
             return
         tot = sum(e["punti"] for e in eventi_ok(db))
-        dati = sorted(((m, punti_musicista(db, m["id"])) for m in db["musicisti"]),
-                      key=lambda x: (-x[1], x[0]["nome"].lower()))
-        pos = posizioni([p for _, p in dati])
-        righe = [(ps, m, p) for ps, (m, p) in zip(pos, dati)]
+        righe = classifica_musicisti(db)
         cols = [Col("pos", "Pos", lambda r: r[0], ">"),
                 Col("nome", "Musicista", lambda r: r[1]["nome"]),
                 Col("soprannome", "Soprannome", lambda r: r[1].get("soprannome") or None),
@@ -1308,6 +1446,7 @@ class Gioco:
             ("Dettaglio di una squadra", self.scegli_squadra),
             ("Migliori e peggiori affari (punti per credito)", self.stat_affari),
             ("Ultimi eventi", self.stat_ultimi_eventi),
+            ("Dettagli di un evento (con i musicisti coinvolti)", self.stat_dettaglio_evento),
             ("Eventi in pending", self.stat_pending),
         ])
 
@@ -1389,14 +1528,15 @@ class Gioco:
         db = self.db
         s = db["impostazioni"]
         r = rosa(db, nome)
-        tot = punti_utente(db, nome)
+        _, tot_ut, tot_coppie = totali_punti(db)
+        tot = tot_ut.get(nome, 0)
         print(f"\nSquadra di {nome}: crediti residui {crediti(db, nome)}/{s['budget_iniziale']}, "
               f"musicisti {len(r)}/{s['musicisti_per_squadra']}")
         if not r:
             print("Nessun musicista in squadra.")
             return
         sp = speso(db, nome)
-        righe = [(m, punti_musicista(db, m["id"], nome)) for m in r]
+        righe = [(m, tot_coppie.get((m["id"], nome), 0)) for m in r]
         cols = [Col("nome", "Musicista", lambda x: x[0]["nome"]),
                 Col("prezzo", "Prezzo", lambda x: x[0]["prezzo"], ">"),
                 Col("spesa", "% spesa", lambda x: x[0]["prezzo"], ">", fmt=lambda v, x: pct(v, sp),
@@ -1420,10 +1560,10 @@ class Gioco:
     def stat_affari(self):
         db = self.db
         righe = []
+        coppie = totali_punti(db)[2]
         for m in db["musicisti"]:
             if m["proprietario"] and m["prezzo"] > 0:
-                p = punti_musicista(db, m["id"], m["proprietario"])
-                righe.append((m, p))
+                righe.append((m, coppie.get((m["id"], m["proprietario"]), 0)))
         if not righe:
             print("Nessun musicista acquistato.")
             return
@@ -1439,10 +1579,46 @@ class Gioco:
         if not self.db["eventi"]:
             print("Nessun evento registrato.")
             return
-        n = prefs(self.me)["righe_eventi"]
-        self.vista("eventi", self.colonne_eventi(), eventi_recenti(self.db, n), ("data", True),
-                   f"\nUltimi {n} eventi (puoi cambiare il numero da Impostazioni > Preferenze)"
-                   if n else "\nTutti gli eventi")
+        periodo = prefs(self.me)["periodo_eventi"]
+        eventi = eventi_periodo(self.db, periodo)
+        self.vista("eventi", self.colonne_eventi(), eventi, ("data", True),
+                   f"\nEventi: {etichetta_periodo(periodo)} ({len(eventi)})"
+                   " - il periodo si cambia da Impostazioni > Preferenze"
+                   "\nUna riga per evento: '(+2)' accanto al musicista significa che ne coinvolge"
+                   " altri due (vedi 'Dettagli di un evento')")
+
+    def stat_dettaglio_evento(self):
+        db = self.db
+        if not db["eventi"]:
+            print("Nessun evento registrato.")
+            return
+        e = self.scegli_per_id(db["eventi"], "ID evento (anche di un musicista coinvolto; invio per "
+                                             "annullare): ",
+                               lambda: self.mostra_eventi(eventi_periodo(db, prefs(self.me)["periodo_eventi"])))
+        if e:
+            self.mostra_dettaglio_evento(e)
+
+    def mostra_dettaglio_evento(self, e):
+        """Tutte le info di un evento registrato, compresi gli altri musicisti coinvolti."""
+        db = self.db
+        gruppo = gruppo_evento(db, e)
+        p = gruppo[0]
+        print(f"\n{p['azione']} - {p.get('data_completamento') or p['data']} - evento #{p['id']}"
+              + (f" - gruppo {p['gruppo']}" if p.get("gruppo") else ""))
+        if p.get("nota"):
+            print(f"Nota: {p['nota']}")
+        if p.get("proposto_da"):
+            print(f"Proposto da {p['proposto_da']}")
+        print(f"\nMusicisti coinvolti ({len(gruppo)}):")
+        for x in gruppo:
+            punti = "PENDING" if x.get("stato") == "pending" else \
+                f"{x['punti']:+d}" + ("*" if x.get("dittatura") else "")
+            ruolo = etichetta_ruolo(x)
+            calcolo = descrivi_calcolo(x, breve=True, con_ruolo=False)
+            print(f"  {nome_musicista(db, x['musicista_id'])}" + (f" - {ruolo}" if ruolo else "") + f": {punti}")
+            print(f"      {x['proprietario'] or 'nessuna squadra'}" + (f" | {calcolo}" if calcolo else ""))
+        tot = sum(x["punti"] for x in gruppo if x.get("stato", "ok") == "ok")
+        print(f"\nTotale evento: {tot:+d} punti")
 
     def stat_pending(self):
         pend = eventi_pending(self.db)
@@ -1539,7 +1715,7 @@ class Gioco:
             print("\n=== Preferenze personali (salvate nel tuo profilo, valgono a ogni accesso) ===")
             print(f"  1. Soprannome (nel saluto e in classifica): {p['soprannome'] or '-'}")
             print(f"  2. Riepilogo all'accesso:                   {'sì' if p['riepilogo_login'] else 'no'}")
-            print(f"  3. Eventi mostrati negli elenchi:           {p['righe_eventi'] or 'tutti'}")
+            print(f"  3. Periodo degli eventi negli elenchi:      {etichetta_periodo(p['periodo_eventi'])}")
             print(f"  4. Recupero password:                       "
                   f"{'impostato' if self.me.get('recupero') else 'non impostato'}")
             print(f"  5. Soprannomi personali dei musicisti:      {len(p['soprannomi_musicisti'])} impostati")
@@ -1555,7 +1731,12 @@ class Gioco:
             elif s == "2":
                 p["riepilogo_login"] = not p["riepilogo_login"]
             elif s == "3":
-                p["righe_eventi"] = ask_int("Quanti eventi mostrare (0 = tutti): ", 0)
+                print("Periodo degli eventi negli elenchi:")
+                for i, (_, etichetta) in enumerate(PERIODI_EVENTI, 1):
+                    print(f"  {i}. {etichetta}")
+                scelta = ask_int(f"Scegli (1-{len(PERIODI_EVENTI)}, 0 = lascia com'è): ", 0, len(PERIODI_EVENTI))
+                if scelta:
+                    p["periodo_eventi"] = PERIODI_EVENTI[scelta - 1][0]
             elif s == "4":
                 self.imposta_recupero()
             elif s == "5":
@@ -1897,7 +2078,7 @@ class Gioco:
             print("Nessun evento registrato.")
             return
         e = self.scegli_per_id(db["eventi"], "ID evento da modificare (invio per annullare): ",
-                               lambda: self.mostra_eventi(eventi_recenti(db, prefs(self.me)["righe_eventi"])))
+                               lambda: self.mostra_eventi(eventi_recenti(db, 30)))   # righe singole: servono gli ID esatti
         if not e:
             return
         while True:
@@ -1988,7 +2169,7 @@ class Gioco:
             print("Nessun evento registrato.")
             return
         e = self.scegli_per_id(ev, "ID evento da eliminare (invio per annullare): ",
-                               lambda: self.mostra_eventi(eventi_recenti(db, prefs(self.me)["righe_eventi"])))
+                               lambda: self.mostra_eventi(eventi_recenti(db, 30)))   # righe singole: servono gli ID esatti
         if not e:
             return
         da_togliere = [e]
@@ -3074,9 +3255,7 @@ class Gioco:
             return
         print(f"Backup prima della chiusura: {crea_backup(db, 'chiusura-stagione')}")
         cl = classifica_giocatori(db)
-        dati_m = sorted(((m, punti_musicista(db, m["id"])) for m in db["musicisti"]),
-                        key=lambda x: (-x[1], x[0]["nome"].lower()))
-        pos_m = posizioni([p for _, p in dati_m])
+        cl_m = classifica_musicisti(db)
         db["storico"].append({
             "id": prossimo_id(db, "stagione"),
             "nome": s["stagione"],
@@ -3084,7 +3263,7 @@ class Gioco:
             "classifica": [{"pos": pos, "nome": n, "punti": p, "musicisti": [m["nome"] for m in rosa(db, n)]}
                            for pos, n, p in cl],
             "musicisti": [{"pos": ps, "nome": m["nome"], "squadra": m["proprietario"], "punti": p}
-                          for ps, (m, p) in zip(pos_m, dati_m)],
+                          for ps, m, p in cl_m],
             "eventi": copy.deepcopy(eventi_ok(db)),
             "scambi": copy.deepcopy([x for x in db["scambi"] if x["stato"] == "accettato"]),
         })

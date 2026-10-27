@@ -90,6 +90,8 @@ TEMI = {
                 "accent": (1.0, 0.55, 0.12), "accent2": (1.0, 0.80, 0.25),
                 "testo": (1.0, 0.87, 0.72), "panel": (0.14, 0.06, 0.02)},
 }
+GIALLO = (0.26, 0.20, 0.02)       # sfondo delle righe degli eventi con più musicisti coinvolti
+EV_PAGINA = 200                   # righe per pagina negli elenchi lunghi (le righe sono widget veri)
 CAMPI_GUI = [("Strumento", "testo"), ("Solista", "sino"), ("Carica/Scarica", "sino"),
              ("Archivista", "sino"), ("Presentatore", "sino")]
 SCALE = {"PICCOLO": 0.85, "MEDIO": 1.0, "GRANDE": 1.2, "MOLTO GRANDE": 1.4}
@@ -305,12 +307,12 @@ DIAG = set(os.environ.get("FM_DIAG", "").split(","))      # prove diagnostiche: 
 
 
 class Panel(BoxLayout):
-    def __init__(self, alpha=0.78, bordo=True, **kw):
+    def __init__(self, alpha=0.78, bordo=True, sfondo=None, **kw):
         super().__init__(**kw)
         if "opaco" in DIAG:
             alpha = 1.0
         with self.canvas.before:
-            self._c = Color(*col("panel"), alpha)
+            self._c = Color(*(sfondo or col("panel")), alpha)
             self._r = Rectangle()
             Color(*col("accent"), 0.55 if bordo else 0)
             self._l = Line(width=1)
@@ -748,7 +750,7 @@ class FantaApp(App):
             scrivi_cfg(self.cfg)
 
     def online_ritmo(self, secondi):
-        """Ritmo dei controlli: 0.5 s se nell'asta online ci sono 2+ squadre collegate, altrimenti 4 s."""
+        """Ritmo dei controlli: 1 s se nell'asta online ci sono 2+ squadre collegate, altrimenti 4 s."""
         if secondi == getattr(self, "_tick_s", 4) or getattr(self, "_tick_ev", None) is None:
             return
         self._tick_ev.cancel()
@@ -1031,8 +1033,9 @@ class FantaApp(App):
         self.render()
 
     # ---------- componenti di lista ----------
-    def riga(self, foto, nome, titolo, sotto="", destra="", azione=None, h=62):
-        p = (RowBtn if azione else Panel)(size_hint_y=None, height=dp(h), padding=dp(7), spacing=dp(10))
+    def riga(self, foto, nome, titolo, sotto="", destra="", azione=None, h=62, sfondo=None):
+        p = (RowBtn if azione else Panel)(size_hint_y=None, height=dp(h), padding=dp(7), spacing=dp(10),
+                                          sfondo=sfondo)
         avatar_nella_riga(p, foto, nome, h - 16)
         c = BoxLayout(orientation="vertical")
         c.add_widget(L(titolo, dim=15, colore="accent", bold=True, shorten=True))
@@ -1224,12 +1227,17 @@ class FantaApp(App):
         for k, nome in self.TABS:
             barra.add_widget(NBtn(nome, dim=10, height=dp(40),
                                   colore=col("accent") if k == tab else attenua(col("accent"), 0.55),
-                                  on_release=lambda *_, k=k: self.sostituisci(self.v_classifica, k)))
+                                  on_release=lambda *_, k=k: self.apri_tab(k)))
         self.corpo.add_widget(barra)
         self.corpo.add_widget(BoxLayout(size_hint_y=None, height=dp(6)))
         sv, g = scroll_list()
         getattr(self, "tab_" + tab)(g)
         self.corpo.add_widget(sv)
+
+    def apri_tab(self, k, nuova=False):
+        """Apre una scheda della classifica; nuova=True arriva da un'altra schermata (si può tornare indietro)."""
+        self.ev_pagina = 0           # cambiando scheda si riparte dalla prima pagina degli eventi
+        (self.vai if nuova else self.sostituisci)(self.v_classifica, k)
 
     def tab_giocatori(self, g):
         db = self.db
@@ -1245,8 +1253,7 @@ class FantaApp(App):
 
     def tab_musicisti(self, g):
         db = self.db
-        dati = sorted(((m, fm.punti_musicista(db, m["id"])) for m in db["musicisti"]),
-                      key=lambda x: (-x[1], x[0]["nome"].lower()))
+        dati = [(m, p) for _, m, p in fm.classifica_musicisti(db)]
         if not dati:
             g.add_widget(L("Nessun musicista.", wrap=True))
         for ps, (m, p) in enumerate(dati, 1):
@@ -1258,21 +1265,100 @@ class FantaApp(App):
                                    lambda i=m["id"]: self.vai(self.v_musicista, i)))
 
     def righe_eventi(self, g, eventi):
+        """Elenco di eventi: una riga ciascuno, si tocca per i dettagli e il calcolo. Quelle che
+        coinvolgono più musicisti sono gialle e dicono quanti sono."""
         db = self.db
+        idx = fm.indice_gruppi(db)       # una volta sola, non per ogni riga
         if not eventi:
             g.add_widget(L("Nessun evento.", wrap=True))
         for e in eventi:
             m = next((x for x in db["musicisti"] if x["id"] == e["musicista_id"]), None)
             pts = "PENDING" if e.get("stato") == "pending" else fmt_pt(e["punti"]) + ("*" if e.get("dittatura") else "")
-            calc = fm.descrivi_calcolo(e)
+            coinv = fm.descrivi_coinvolti(db, e, idx=idx)
             sotto = f"{e.get('data_completamento') or e['data']} | {e['proprietario'] or '-'}" + \
-                    (f" | {calc}" if calc else "") + \
-                    (f" | proposto da {e['proposto_da']}" if e.get("proposto_da") else "")
+                    (f" | proposto da {e['proposto_da']}" if e.get("proposto_da") else "") + \
+                    (f" | {coinv}" if coinv else "")
             g.add_widget(self.riga(m.get("foto") if m else None, m["nome"] if m else "?",
-                                   f"{m['nome'] if m else '?'} - {e['azione']}", sotto, pts))
+                                   f"{m['nome'] if m else '?'} - {e['azione']}", sotto, pts,
+                                   azione=lambda e=e: self.popup_evento(e),
+                                   sfondo=GIALLO if coinv else None))
+
+    def popup_evento(self, e):
+        """Dettagli di un evento registrato: nota, calcolo e tutti i musicisti coinvolti."""
+        db = self.db
+        gruppo = fm.gruppo_evento(db, e)
+        p = gruppo[0]
+        tot = sum(x["punti"] for x in gruppo if x.get("stato", "ok") == "ok")
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        sv, g = scroll_list(6)
+        testa = f"{p.get('data_completamento') or p['data']} | evento #{p['id']}" + \
+                (f" | gruppo {p['gruppo']}" if p.get("gruppo") else "")
+        g.add_widget(L(testa, dim=12, wrap=True))
+        if p.get("nota"):
+            g.add_widget(L(f"Nota: {p['nota']}", dim=12, wrap=True))
+        if p.get("proposto_da"):
+            g.add_widget(L(f"Proposto da {p['proposto_da']}", dim=12, wrap=True))
+        for x in gruppo:
+            m = next((y for y in db["musicisti"] if y["id"] == x["musicista_id"]), None)
+            nome = m["nome"] if m else "?"
+            pts = "PENDING" if x.get("stato") == "pending" else fmt_pt(x["punti"]) + ("*" if x.get("dittatura") else "")
+            calcolo = fm.descrivi_calcolo(x, breve=True, con_ruolo=False)
+            ruolo = fm.etichetta_ruolo(x)
+            g.add_widget(self.riga(m.get("foto") if m else None, nome,
+                                   f"{nome} - {ruolo}" if ruolo else nome,
+                                   " | ".join(filter(None, [x["proprietario"] or "nessuna squadra", calcolo])),
+                                   pts, sfondo=GIALLO if x["id"] == e["id"] and len(gruppo) > 1 else None))
+        box.add_widget(sv)
+        if len(gruppo) > 1:
+            box.add_widget(L(f"Totale evento: {fmt_pt(tot)} punti", dim=14, colore="accent2", bold=True,
+                             size_hint_y=None, height=dp(26)))
+        pop = self.popup(p["azione"].upper(), box, 0.9, 0.85)
+        box.add_widget(NBtn("CHIUDI", colore=attenua(col("accent"), 0.7), on_release=lambda *_: pop.dismiss()))
 
     def tab_eventi(self, g):
-        self.righe_eventi(g, fm.eventi_recenti(self.db, fm.prefs(self.me)["righe_eventi"]))
+        """Eventi del periodo scelto, a pagine di EV_PAGINA righe."""
+        periodo = fm.prefs(self.me)["periodo_eventi"]
+        for fetta in (fm.PERIODI_EVENTI[:3], fm.PERIODI_EVENTI[3:]):
+            r = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(4))
+            for codice, etichetta in fetta:
+                r.add_widget(NBtn(etichetta.upper(), dim=9, height=dp(34),
+                                  colore=col("accent") if codice == periodo else attenua(col("accent"), 0.55),
+                                  on_release=lambda *_, c=codice: self.cambia_periodo_eventi(c)))
+            g.add_widget(r)
+        eventi = fm.eventi_periodo(self.db, periodo)
+        quanti = len(eventi)
+        if not quanti:
+            g.add_widget(L(f"Nessun evento: {fm.etichetta_periodo(periodo)}. Scegli un periodo più lungo "
+                           f"qui sopra.", wrap=True))
+            return
+        pagine = (quanti + EV_PAGINA - 1) // EV_PAGINA
+        pag = min(max(getattr(self, "ev_pagina", 0), 0), pagine - 1)
+        self.ev_pagina = pag
+        primo = pag * EV_PAGINA
+        fetta = eventi[primo:primo + EV_PAGINA]
+        g.add_widget(L(f"{fm.etichetta_periodo(periodo)}: {quanti} eventi" +
+                       (f" | pagina {pag + 1} di {pagine} (righe {primo + 1}-{primo + len(fetta)})"
+                        if pagine > 1 else ""),
+                       dim=11, colore="accent2", size_hint_y=None, height=dp(22)))
+        self.righe_eventi(g, fetta)
+        if pagine > 1:
+            nav = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
+            for testo, delta, attivo in (("< PIÙ RECENTI", -1, pag > 0), ("PIÙ VECCHI >", 1, pag < pagine - 1)):
+                nav.add_widget(NBtn(testo, dim=10, height=dp(42),
+                                    colore=col("accent") if attivo else attenua(col("accent"), 0.35),
+                                    on_release=(lambda *_, d=delta: self.pagina_eventi(d)) if attivo
+                                    else (lambda *_: None)))
+            g.add_widget(nav)
+
+    def cambia_periodo_eventi(self, codice):
+        fm.prefs(self.me)["periodo_eventi"] = codice
+        self.ev_pagina = 0
+        self.salva()
+        self.sostituisci(self.v_classifica, "eventi")
+
+    def pagina_eventi(self, delta):
+        self.ev_pagina = max(0, getattr(self, "ev_pagina", 0) + delta)
+        self.sostituisci(self.v_classifica, "eventi")
 
     def tab_pending(self, g):
         self.righe_eventi(g, fm.eventi_pending(self.db))
@@ -1313,7 +1399,9 @@ class FantaApp(App):
         info = BoxLayout(orientation="vertical", spacing=dp(2))
         info.add_widget(L(fm.etichetta_utente(db, nome), dim=18, colore="accent", bold=True, shorten=True))
         r = fm.rosa(db, nome)
-        info.add_widget(L(f"{fm.punti_utente(db, nome)} punti", dim=16, colore="accent2"))
+        _, tot_ut, tot_coppie = fm.totali_punti(db)      # sommati una volta sola per tutta la schermata
+        punti_in_squadra = lambda x: tot_coppie.get((x["id"], nome), 0)
+        info.add_widget(L(f"{tot_ut.get(nome, 0)} punti", dim=16, colore="accent2"))
         info.add_widget(L(f"crediti {fm.crediti(db, nome)}/{s['budget_iniziale']}", dim=12))
         info.add_widget(L(f"musicisti {len(r)}/{s['musicisti_per_squadra']}", dim=12))
         top.add_widget(info)
@@ -1329,13 +1417,13 @@ class FantaApp(App):
         self.sezione(g, "MUSICISTI IN SQUADRA")
         if not r:
             g.add_widget(L("Nessun musicista in squadra.", wrap=True))
-        for m in sorted(r, key=lambda x: -fm.punti_musicista(db, x["id"], nome)):
-            p = fm.punti_musicista(db, m["id"], nome)
+        for m in sorted(r, key=lambda x: -punti_in_squadra(x)):
+            p = punti_in_squadra(m)
             g.add_widget(self.riga(m.get("foto"), m["nome"], m["nome"],
                                    f"prezzo {m['prezzo']} | punti/credito "
                                    f"{(p / m['prezzo']) if m['prezzo'] else 0:.2f}", p,
                                    lambda i=m["id"]: self.vai(self.v_musicista, i)))
-        ex = fm.punti_utente(db, nome) - sum(fm.punti_musicista(db, m["id"], nome) for m in r)
+        ex = tot_ut.get(nome, 0) - sum(punti_in_squadra(m) for m in r)
         if ex:
             g.add_widget(L(f"Punti maturati da musicisti non più in squadra: {ex:+d}", dim=11, wrap=True))
         self.sezione(g, "ULTIMI EVENTI DELLA SQUADRA")
@@ -1719,8 +1807,8 @@ class FantaApp(App):
         g.add_widget(NBtn(f"SOPRANNOME: {p['soprannome'] or '-'}", dim=12, on_release=lambda *_: self.f_soprannome()))
         g.add_widget(NBtn(f"RIEPILOGO ALL'ACCESSO: {'SI' if p['riepilogo_login'] else 'NO'}", dim=12,
                           on_release=lambda *_: self.toggle_riepilogo()))
-        g.add_widget(NBtn(f"EVENTI NEGLI ELENCHI: {p['righe_eventi'] or 'TUTTI'}", dim=12,
-                          on_release=lambda *_: self.f_righe_eventi()))
+        g.add_widget(NBtn(f"PERIODO DEGLI EVENTI: {fm.etichetta_periodo(p['periodo_eventi']).upper()}", dim=12,
+                          on_release=lambda *_: self.apri_tab("eventi", nuova=True)))
         g.add_widget(NBtn("CAMBIA PASSWORD", dim=12, on_release=lambda *_: self.f_password()))
         g.add_widget(NBtn("IMPOSTAZIONI DELLA STAGIONE (lettura)", dim=12,
                           on_release=lambda *_: self.vai(self.v_impostazioni)))
@@ -1740,18 +1828,6 @@ class FantaApp(App):
             self.salva()
             self.render()
         self.form("SOPRANNOME", [("s", "Soprannome (max 20, '-' per toglierlo)", p["soprannome"], {})], ok, h=0.45)
-
-    def f_righe_eventi(self):
-        p = fm.prefs(self.me)
-
-        def ok(v):
-            if not v["n"].isdigit():
-                self.msg("Inserisci un numero intero (0 = tutti).")
-                return False
-            p["righe_eventi"] = int(v["n"])
-            self.salva()
-            self.render()
-        self.form("EVENTI MOSTRATI", [("n", "Quanti eventi mostrare (0 = tutti)", p["righe_eventi"], {})], ok, h=0.45)
 
     def f_password(self):
         def ok(v):
@@ -2060,34 +2136,29 @@ class FantaApp(App):
                     basi.append((esito[1], "punteggio libero", False, [], None))
                 else:
                     basi.append((None, "", True, [], (esito[1], esito[2])))
-                bonus_principali = [{"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"]}
-                                    for cb, b in st["bonus"] if cb.active]
-                nota = st["nota"].text.strip()
-                gruppo = fm.prossimo_id(db, "gruppo") if len(coppie) > 1 else None
-                esiti = []
-                for (m, s), (base, dett, pending, voti, fascia) in zip(coppie, basi):
-                    ruolo = self.g.ruolo_evento(a, s)
-
-                    # SE s IS NOT NONE SIGNIFICA CHE È UN ID PRINCIPALE (HA UNO SLOT), ALTRIMENTI È UN MUSICISTA AGGIUNTIVO
-                    bonus_correnti = bonus_principali if s is not None else []
-
-                    if dittatura:
-                        self.g.aggiungi_evento(m, a, base, base, [], "", False, nota, dittatura=True,
-                                                gruppo=gruppo, ruolo=ruolo)
-                        esiti.append(f"{base:+d} a {m['nome']} (DITTATURA)")
-                    elif proposta:
-                        e = self.g.aggiungi_evento(m, a, None, base, bonus_correnti, dett, True, nota, fascia=fascia,
-                                                    voti=voti, gruppo=gruppo, ruolo=ruolo)
-                        # sondaggio: il voto del giocatore resta fra i voti, l'admin può aggiungerne altri e chiudere
-                        e["da_approvare"], e["proposto_da"] = True, me["nome"]
-                        e["proposta_base"] = None if (s and a["modalita"] == "sondaggio") else base
-                        esiti.append(f"{m['nome']}: in attesa di conferma")
-                    else:
-                        punti = None if pending else fm.calcola_punti(base, bonus_correnti)
-                        self.g.aggiungi_evento(m, a, punti, base, bonus_correnti, dett, pending, nota, fascia=fascia,
-                                                voti=voti, gruppo=gruppo, ruolo=ruolo)
-                        esiti.append(f"{m['nome']}: " + ("PENDING" if pending else f"{punti:+d}"))
-
+            bonus = [{"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"]}
+                     for cb, b in st["bonus"] if cb.active]
+            nota = st["nota"].text.strip()
+            gruppo = fm.prossimo_id(db, "gruppo") if len(coppie) > 1 else None
+            esiti = []
+            for (m, s), (base, dett, pending, voti, fascia) in zip(coppie, basi):
+                ruolo = self.g.ruolo_evento(a, s)
+                if dittatura:
+                    self.g.aggiungi_evento(m, a, base, base, [], "", False, nota, dittatura=True,
+                                           gruppo=gruppo, ruolo=ruolo)
+                    esiti.append(f"{base:+d} a {m['nome']} (DITTATURA)")
+                elif proposta:
+                    e = self.g.aggiungi_evento(m, a, None, base, bonus, dett, True, nota, fascia=fascia,
+                                               voti=voti, gruppo=gruppo, ruolo=ruolo)
+                    # sondaggio: il voto del giocatore resta fra i voti, l'admin può aggiungerne altri e chiudere
+                    e["da_approvare"], e["proposto_da"] = True, me["nome"]
+                    e["proposta_base"] = None if (s and a["modalita"] == "sondaggio") else base
+                    esiti.append(f"{m['nome']}: in attesa di conferma")
+                else:
+                    punti = None if pending else fm.calcola_punti(base, bonus)
+                    self.g.aggiungi_evento(m, a, punti, base, bonus, dett, pending, nota, fascia=fascia,
+                                           voti=voti, gruppo=gruppo, ruolo=ruolo)
+                    esiti.append(f"{m['nome']}: " + ("PENDING" if pending else f"{punti:+d}"))
             self.salva()
             pop.dismiss()
             self.msg(("Proposta inviata: l'admin la confermerà dalla sezione Pending.\n" if proposta
@@ -2201,7 +2272,7 @@ class FantaApp(App):
                     fm.riempi_buco(db, "eventi", "evento", x["id"])
             self.finito(pop)
         if ha_proposta:
-            box.add_widget(NBtn("CONFERMA PUNTI", on_release=lambda *_: conferma()))
+            box.add_widget(NBtn("CONFERMA COME PROPOSTO", on_release=lambda *_: conferma()))
         else:
             box.add_widget(NBtn("SALVA I VOTI (RESTA IN PENDING)", on_release=lambda *_: applica(False)))
             box.add_widget(NBtn("CHIUDI L'EVENTO CON LA MEDIA", on_release=lambda *_: applica(True)))
@@ -2444,7 +2515,7 @@ class FantaApp(App):
         for t in sq:
             voce(st["on"], ("● " if e_collegato(t.get("visto")) else "○ ") + f"{t['nome']} ({t['crediti']} cr.)",
                  "accent" if e_collegato(t.get("visto")) else "testo")
-        self.online_ritmo(0.5 if sum(0.5 for t in sq if e_collegato(t.get("visto"))) >= 2 else 4)
+        self.online_ritmo(1 if sum(1 for t in sq if e_collegato(t.get("visto"))) >= 2 else 4)
 
     def live_chiamata(self, rpc, ok, **par):
         st = self.live

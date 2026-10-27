@@ -131,17 +131,11 @@ class Online:
         r = self.rpc("fm_a_scarica", p_admin=self.admin)
         return r["versione"], r["dati"]
 
-    # ----- richieste dei giocatori -----
-    def richieste(self):
-        return self.rpc("fm_a_prendi", p_admin=self.admin)["richieste"]
-
-    def esiti(self, lista):
-        if lista:
-            self.rpc("fm_a_esito", p_admin=self.admin, p_esiti=lista)
-
 
 # --------------------------------------------------------------------------
 # Applicazione delle richieste dei giocatori (regole originali del gioco)
+# Online le richieste le applica Supabase da solo: queste funzioni restano come copia di riferimento
+# delle stesse regole in Python (le prove automatiche confrontano riga per riga i due risultati).
 # --------------------------------------------------------------------------
 class RichiestaNonValida(Exception):
     pass
@@ -349,27 +343,6 @@ def elabora_richiesta(db, r):
         return "errore", str(e)
     except Exception as e:      # una richiesta malformata non deve mai bloccare le altre
         return "errore", f"Richiesta non valida ({e.__class__.__name__})"
-
-
-def elabora_richieste(db, richieste):
-    """Applica le richieste in ordine. Ritorna ([esiti per fm_a_esito], True se il database è cambiato).
-    Ogni richiesta viene applicata UNA sola volta: l'esito resta annotato nel database
-    (richieste_applicate), così anche se la risposta al server si perde non si duplica nulla."""
-    reg = db.setdefault("richieste_applicate", {})
-    esiti, cambiato = [], False
-    for r in richieste:
-        k = str(r["id"])
-        if k in reg:
-            stato, msg = reg[k]
-        else:
-            stato, msg = elabora_richiesta(db, r)
-            reg[k] = [stato, msg]
-            cambiato = True
-        esiti.append({"id": r["id"], "stato": stato, "msg": msg})
-    if len(reg) > 400:
-        for k in sorted(reg, key=int)[:-300]:
-            del reg[k]
-    return esiti, cambiato
 
 
 # --------------------------------------------------------------------------
