@@ -749,8 +749,8 @@ class FantaApp(App):
             self.cfg["online_versione"] = ver
             scrivi_cfg(self.cfg)
 
-    def online_ritmo(self, secondi):
-        """Ritmo dei controlli: 1 s se nell'asta online ci sono 2+ squadre collegate, altrimenti 4 s."""
+    def online_ritmo(self, secondi = 0.5):
+        """Ritmo dei controlli: 0.5 s se nell'asta online ci sono 2+ squadre collegate, altrimenti 4 s."""
         if secondi == getattr(self, "_tick_s", 4) or getattr(self, "_tick_ev", None) is None:
             return
         self._tick_ev.cancel()
@@ -2272,7 +2272,7 @@ class FantaApp(App):
                     fm.riempi_buco(db, "eventi", "evento", x["id"])
             self.finito(pop)
         if ha_proposta:
-            box.add_widget(NBtn("CONFERMA COME PROPOSTO", on_release=lambda *_: conferma()))
+            box.add_widget(NBtn("CONFERMA I PUNTI", on_release=lambda *_: conferma()))
         else:
             box.add_widget(NBtn("SALVA I VOTI (RESTA IN PENDING)", on_release=lambda *_: applica(False)))
             box.add_widget(NBtn("CHIUDI L'EVENTO CON LA MEDIA", on_release=lambda *_: applica(True)))
