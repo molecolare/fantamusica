@@ -143,7 +143,7 @@ def nuovo_db():
         "scambi": [],      # {id, data, da, a, offro, chiedo, nomi_offro, nomi_chiedo, crediti, stato}
         "storico": [],     # stagioni archiviate
         "eventi": [],      # {id, data, musicista_id, azione_id, azione, stato: ok|pending, punti, base,
-                           #  bonus: [snapshot], voti, gruppo, dettaglio, dittatura, proprietario, nota}
+                           #  bonus: [snapshot], voti, votanti, aventi_diritto_voto, gruppo, dettaglio, dittatura, proprietario, nota}
         "contatori": {"musicista": 1, "azione": len(AZIONI_BASE) + 1, "evento": 1, "campo": 1, "bonus": 1,
                        "scambio": 1, "gruppo": 1, "stagione": 1},
     }
@@ -482,6 +482,12 @@ def eventi_pending(db):
     return [e for e in db["eventi"] if e.get("stato", "ok") == "pending"]
 
 
+def eventi_auto_chiusi(db):
+    """Sondaggi che erano in pending e sono stati chiusi automaticamente quando hanno votato
+    tutti i giocatori aventi diritto. Il flag resta nello storico per permettere all'admin di filtrarli."""
+    return [e for e in db["eventi"] if e.get("stato", "ok") == "ok" and e.get("chiusura_automatica_voti")]
+
+
 def totali_punti(db):
     """Somma i punti di tutti gli eventi validi in una sola passata. Ritorna tre dizionari:
     {id musicista: punti}, {nome giocatore: punti}, {(id musicista, nome giocatore): punti}.
@@ -752,6 +758,74 @@ def base_da_voti(voti):
         return voti[0], f"sondaggio {voti[0]}"
     m = media_voti(voti)
     return m, f"sondaggio: voti {', '.join(map(str, voti))} = media {m}"
+
+
+def aventi_diritto_voto(db, e=None):
+    """Nomi dei giocatori che devono votare un sondaggio.
+
+    Per i nuovi pending l'elenco viene fotografato quando nasce l'evento, cosi' l'ingresso/uscita di un
+    giocatore a sondaggio gia' aperto non cambia il quorum. Per i vecchi pending senza snapshot si usa
+    l'elenco corrente dei partecipanti alla stagione.
+    """
+    salvati = e.get("aventi_diritto_voto") if e else None
+    if isinstance(salvati, list) and salvati:
+        visti, out = set(), []
+        for nome in salvati:
+            if isinstance(nome, str) and nome and nome not in visti:
+                visti.add(nome); out.append(nome)
+        if out:
+            return out
+    return [u["nome"] for u in giocatori(db)]
+
+
+def progresso_voti(db, e):
+    """(votanti_validi, aventi_diritto) senza rivelare i valori dei voti."""
+    aventi = aventi_diritto_voto(db, e)
+    ammessi = set(aventi)
+    votanti = []
+    for nome in e.get("votanti", []):
+        if nome in ammessi and nome not in votanti:
+            votanti.append(nome)
+    return len(votanti), len(aventi)
+
+
+def chiudi_sondaggio_se_completo(db, e):
+    """Chiude un pending quando ha espresso un voto ogni giocatore avente diritto.
+
+    I voti devono essere uno per votante: se un vecchio pending contiene voti aggiunti manualmente
+    dall'admin, non viene chiuso automaticamente. Questo evita che il vecchio bug possa influire sul
+    risultato; l'admin potra' eliminarlo e riproporlo.
+    """
+    if not e or e.get("stato", "ok") != "pending" or e.get("proposta_base") is not None:
+        return False
+    aventi = aventi_diritto_voto(db, e)
+    ammessi = set(aventi)
+    votanti = []
+    for nome in e.get("votanti", []):
+        if nome in ammessi and nome not in votanti:
+            votanti.append(nome)
+    voti = list(e.get("voti", []))
+    if not aventi or len(votanti) != len(aventi) or len(voti) != len(votanti):
+        return False
+    base, dettaglio = base_da_voti(voti)
+    adesso = datetime.now().strftime("%Y-%m-%d %H:%M")
+    gruppo = gruppo_voto(db, e, eventi_pending(db))
+    for x in gruppo:
+        x["voti"], x["base"], x["dettaglio"] = list(voti), base, dettaglio
+        punti = calcola_punti(base, x.get("bonus", []))
+        if not x.get("dittatura"):
+            m = musicista(db, x["musicista_id"])
+            giorno_evento = (x.get("data") or "")[:10] or None
+            punti, x["bonus_auto"] = applica_bonus_automatici(
+                db, m, punti, proprietario=x.get("proprietario"), oggi=giorno_evento
+            ) if m else (punti, [])
+        x["punti"] = punti
+        x["stato"] = "ok"
+        x["da_approvare"] = False
+        x["data_completamento"] = adesso
+        x["chiusura_automatica_voti"] = True
+        x["voti_richiesti"] = len(aventi)
+    return True
 
 
 def descrivi_bonus(b):
@@ -1834,7 +1908,7 @@ class Gioco:
         self.menu("Pannello admin", [
             ("Registra evento / assegna punti", self.registra_evento),
             ("DITTATURA (evento con punteggio deciso a mano)", self.dittatura),
-            ("Pending: voti e completamento", self.gestisci_pending),
+            ("Pending: controllo sondaggi e proposte", self.gestisci_pending),
             ("Modifica un evento", self.modifica_evento),
             ("Asta musicisti", self.asta),
             ("Gestione musicisti", self.menu_musicisti),
@@ -1896,18 +1970,10 @@ class Gioco:
         annullato. s = ruolo/punteggio del musicista, ctx = risposte da condividere fra i musicisti
         dello stesso evento (la quantita' si chiede una volta sola), chi = nome per i messaggi."""
         if a["modalita"] == "sondaggio":
-            lo, hi = s["min"], s["max"]
-            while True:
-                r = ask(f"Voto del sondaggio per {chi} da {lo} a {hi} (più voti separati da spazio o virgola = "
-                        f"media; invio = lascia in PENDING): ")
-                if not r:
-                    return None, "", True, []
-                voti = parse_voti(r, lo, hi)
-                if voti is None:
-                    print(f"Inserisci uno o più interi da {lo} a {hi}.")
-                    continue
-                base, dettaglio = base_da_voti(voti)
-                return base, dettaglio, False, voti
+            # I sondaggi non ricevono piu' voti dall'admin: ogni giocatore vota una sola volta col
+            # proprio codice e il pending si chiude automaticamente al raggiungimento del quorum.
+            print(f"Sondaggio segreto per {chi} ({s['min']}-{s['max']}): viene aperto ai giocatori e resta in PENDING.")
+            return None, "", True, []
         if a["modalita"] == "tempo":
             if "quantita" not in ctx:
                 while True:
@@ -2009,6 +2075,10 @@ class Gioco:
             punti = None if pending else calcola_punti(base, b)
             e = self.aggiungi_evento(m, a, punti, base, b, dettaglio, pending, nota, fascia=fascia,
                                      voti=voti, gruppo=gruppo, ruolo=self.ruolo_evento(a, s))
+            if pending and fascia:
+                e["aventi_diritto_voto"] = [u["nome"] for u in giocatori(db)]
+                e["votanti"] = []
+                e["dettaglio"] = "sondaggio segreto"
             dove = f"alla squadra di {m['proprietario']}" if m["proprietario"] else "a nessuno (musicista senza squadra)"
             if pending:
                 print(f"Evento {e['id']} in PENDING per {m['nome']} ({a['nome']}).")
@@ -2016,7 +2086,7 @@ class Gioco:
                 calcolo = descrivi_calcolo(e)
                 print(f"Registrato: {punti:+d} a {m['nome']} -> {dove}." + (f" [{calcolo}]" if calcolo else ""))
         if any(r[2] for r in basi):
-            print("Aggiungi i voti e completa l'evento da 'Pending: voti e completamento' quando il sondaggio è chiuso.")
+            print("I sondaggi sono segreti: ogni giocatore vota una volta e il pending si chiude automaticamente quando hanno votato tutti.")
 
     @solo_admin
     def dittatura(self):
@@ -2048,53 +2118,17 @@ class Gioco:
                                self.mostra_pending)
         if not e:
             return
-        gruppo = gruppo_voto(db, e, eventi_pending(db))
-        az = next((a for a in db["azioni"] if a["id"] == e.get("azione_id")), None)
-        lo, hi = (e.get("fascia") or ((az["min"], az["max"]) if az else (1, 10)))
-        voti = list(e.get("voti", []))
-        if len(gruppo) > 1:
-            print("L'evento vale per: " + ", ".join(nome_musicista(db, x["musicista_id"]) for x in gruppo))
-        while True:
-            print(f"\n{e['azione']} - voti finora: {', '.join(map(str, voti)) or 'nessuno'}"
-                  + (f" (media {media_voti(voti)})" if voti else ""))
-            s = ask(f"Voti da aggiungere da {lo} a {hi} (separati da spazio o virgola; "
-                    f"invio = basta così, - = azzera i voti): ")
-            if not s:
-                break
-            if s == "-":
-                voti = []
-                continue
-            nuovi = parse_voti(s, lo, hi)
-            if nuovi is None:
-                print(f"Inserisci interi da {lo} a {hi}.")
-                continue
-            voti += nuovi
-        if not voti:
-            for x in gruppo:
-                x["voti"], x["dettaglio"] = [], ""
-            print("Nessun voto: l'evento resta in pending.")
+        if e.get("proposta_base") is not None:
+            base = e["proposta_base"]
+            print(f"Proposta con punteggio base {base}. Le proposte non a sondaggio restano da confermare dall'admin.")
             return
-        if ask_si(f"Chiudere ora l'evento con la media di {len(voti)} voti ({media_voti(voti)})?"):
-            base, dettaglio = base_da_voti(voti)
-            for x in gruppo:
-                x["voti"], x["base"], x["dettaglio"] = list(voti), base, dettaglio
-                punti = calcola_punti(base, x["bonus"])
-                if not x.get("dittatura"):
-                    m = musicista(db, x["musicista_id"])
-                    giorno_evento = (x.get("data") or "")[:10] or None
-                    punti, x["bonus_auto"] = applica_bonus_automatici(
-                        db, m, punti, proprietario=x.get("proprietario"), oggi=giorno_evento
-                    ) if m else (punti, [])
-                x["punti"] = punti
-                x["stato"] = "ok"
-                x["data_completamento"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                print(f"Evento {x['id']} completato: {x['punti']:+d} punti "
-                      f"({nome_musicista(db, x['musicista_id'])} -> {x['proprietario'] or 'nessuna squadra'}).")
-        else:
-            for x in gruppo:
-                x["voti"] = list(voti)
-                x["dettaglio"] = f"voti finora: {', '.join(map(str, voti))}"
-            print("Voti salvati: l'evento resta in pending.")
+        fatti, necessari = progresso_voti(db, e)
+        print(f"Sondaggio segreto: hanno votato {fatti}/{necessari} giocatori aventi diritto.")
+        print("I valori restano nascosti finche' il sondaggio e' aperto. Non e' possibile aggiungere, azzerare o "
+              "chiudere voti dall'admin: al raggiungimento del quorum l'evento si chiude automaticamente.")
+        if len(e.get("voti", [])) != len(e.get("votanti", [])):
+            print("ATTENZIONE: questo e' un vecchio pending con voti non associati ai giocatori. Per sicurezza non "
+                  "verra' auto-chiuso: se necessario eliminalo e riproponilo.")
 
     @solo_admin
     def modifica_evento(self):
@@ -2149,8 +2183,14 @@ class Gioco:
                     e.pop("data_completamento", None)
                     if a["modalita"] == "sondaggio":
                         e["fascia"] = [sl["min"], sl["max"]]
+                        if pending:
+                            e["aventi_diritto_voto"] = [u["nome"] for u in giocatori(db)]
+                            e["votanti"] = []
+                            e["dettaglio"] = "sondaggio segreto"
                     else:
                         e.pop("fascia", None)
+                        e.pop("aventi_diritto_voto", None)
+                        e.pop("votanti", None)
                     print("Evento ricalcolato.")
             elif s == "3":
                 p = ask_int("Nuovo punteggio finale: ")

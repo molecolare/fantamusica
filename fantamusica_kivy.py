@@ -1231,8 +1231,13 @@ class FantaApp(App):
 
     def v_classifica(self, tab="giocatori"):
         self.titolo("CLASSIFICA")
+        tabs = list(self.TABS)
+        if self.e_admin():
+            tabs.insert(4, ("auto_chiusi", "AUTO-CHIUSI"))
+        if tab == "auto_chiusi" and not self.e_admin():
+            tab = "eventi"
         barra = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
-        for k, nome in self.TABS:
+        for k, nome in tabs:
             barra.add_widget(NBtn(nome, dim=10, height=dp(40),
                                   colore=col("accent") if k == tab else attenua(col("accent"), 0.55),
                                   on_release=lambda *_, k=k: self.apri_tab(k)))
@@ -1310,7 +1315,11 @@ class FantaApp(App):
             m = next((y for y in db["musicisti"] if y["id"] == x["musicista_id"]), None)
             nome = m["nome"] if m else "?"
             pts = "PENDING" if x.get("stato") == "pending" else fmt_pt(x["punti"]) + ("*" if x.get("dittatura") else "")
-            calcolo = fm.descrivi_calcolo(x, breve=True, con_ruolo=False)
+            if x.get("stato") == "pending" and x.get("fascia"):
+                fatti, necessari = fm.progresso_voti(db, x)
+                calcolo = f"sondaggio segreto: {fatti}/{necessari} votanti"
+            else:
+                calcolo = fm.descrivi_calcolo(x, breve=True, con_ruolo=False)
             ruolo = fm.etichetta_ruolo(x)
             g.add_widget(self.riga(m.get("foto") if m else None, nome,
                                    f"{nome} - {ruolo}" if ruolo else nome,
@@ -1374,6 +1383,18 @@ class FantaApp(App):
 
     def tab_pending(self, g):
         self.righe_eventi(g, fm.eventi_pending(self.db))
+
+    def tab_auto_chiusi(self, g):
+        if not self.e_admin():
+            g.add_widget(L("Sezione riservata all'admin.", wrap=True))
+            return
+        ev = sorted(fm.eventi_auto_chiusi(self.db),
+                    key=lambda e: (e.get("data_completamento") or e.get("data", ""), e["id"]), reverse=True)
+        ev = fm.comprimi_gruppi(ev)
+        g.add_widget(L("Sondaggi chiusi automaticamente perché hanno votato tutti i giocatori aventi diritto. "
+                       "Da qui puoi controllarli; per annullarne uno usa Pannello admin > Elimina un evento.",
+                       wrap=True, dim=11, colore="accent2"))
+        self.righe_eventi(g, ev)
 
     def tab_cumulativa(self, g):
         db = self.db
@@ -2514,7 +2535,7 @@ class FantaApp(App):
                              row_force_default=True)
         griglia.bind(minimum_height=griglia.setter("height"))
         voci = [("DITTATURA (punteggio a mano)", lambda: self.f_evento(True)),
-                ("PENDING: VOTI E COMPLETAMENTO", lambda: self.vai(self.v_pending)),
+                ("PENDING: CONTROLLO SONDAGGI", lambda: self.vai(self.v_pending)),
                 ("ASTA MUSICISTI", lambda: self.vai(self.v_asta)),
                 ("GESTIONE MUSICISTI", lambda: self.vai(self.v_gest_musicisti)),
                 ("GESTIONE UTENTI", lambda: self.vai(self.v_gest_utenti)),
@@ -2639,8 +2660,13 @@ class FantaApp(App):
                 if dittatura:
                     w = campo(hint="punteggio finale (anche negativo)")
                 elif a["modalita"] == "sondaggio":
-                    w = campo(hint=(f"il tuo voto da {s['min']} a {s['max']} (facoltativo)" if proposta else
-                                    f"voto da {s['min']} a {s['max']}: registrato subito (vuoto = PENDING)"))
+                    if proposta:
+                        w = campo(hint=f"il tuo voto segreto da {s['min']} a {s['max']} (facoltativo)")
+                    else:
+                        w = None
+                        dyn.add_widget(L(f"Sondaggio segreto {s['min']}-{s['max']}: l'admin non inserisce voti. "
+                                         "Si chiude automaticamente quando hanno votato tutti i giocatori.",
+                                         dim=11, colore="accent2", wrap=True, size_hint_y=None, height=dp(42)))
                 else:
                     w = None
                 if w:
@@ -2690,12 +2716,14 @@ class FantaApp(App):
                         return
                     basi.append((p, "", False, [], None))
                 elif a["modalita"] == "sondaggio":
-                    if not w.text.strip():
+                    if not proposta:
+                        basi.append((None, "", True, [], (s["min"], s["max"])))
+                    elif not w.text.strip():
                         basi.append((None, "", True, [], (s["min"], s["max"])))
                     else:
                         voti = fm.parse_voti(w.text, s["min"], s["max"])
-                        if voti is None:
-                            self.msg(f"Per {m['nome']} inserisci interi da {s['min']} a {s['max']}.")
+                        if voti is None or len(voti) != 1:
+                            self.msg(f"Per {m['nome']} inserisci un solo voto da {s['min']} a {s['max']}.")
                             return
                         b, d = fm.base_da_voti(voti)
                         basi.append((b, d, False, voti, (s["min"], s["max"])))
@@ -2754,18 +2782,28 @@ class FantaApp(App):
                 elif proposta:
                     e = self.g.aggiungi_evento(m, a, None, base, bonus, dett, True, nota, fascia=fascia,
                                                voti=voti, gruppo=gruppo, ruolo=ruolo)
-                    # sondaggio: il voto del giocatore resta fra i voti, l'admin può aggiungerne altri e chiudere
                     e["da_approvare"], e["proposto_da"] = True, me["nome"]
-                    e["proposta_base"] = None if (s and a["modalita"] == "sondaggio") else base
-                    esiti.append(f"{m['nome']}: in attesa di conferma")
+                    e["proposta_base"] = None if fascia else base
+                    if fascia:
+                        e["aventi_diritto_voto"] = [u["nome"] for u in fm.giocatori(db)]
+                        e["votanti"] = [me["nome"]] if voti and me["nome"] in e["aventi_diritto_voto"] else []
+                        chiuso = fm.chiudi_sondaggio_se_completo(db, e)
+                        esiti.append(f"{m['nome']}: " + (f"chiuso automaticamente ({e['punti']:+d})" if chiuso
+                                                            else "sondaggio segreto in corso"))
+                    else:
+                        esiti.append(f"{m['nome']}: in attesa di conferma")
                 else:
                     punti = None if pending else fm.calcola_punti(base, bonus)
-                    self.g.aggiungi_evento(m, a, punti, base, bonus, dett, pending, nota, fascia=fascia,
-                                           voti=voti, gruppo=gruppo, ruolo=ruolo)
+                    e = self.g.aggiungi_evento(m, a, punti, base, bonus, dett, pending, nota, fascia=fascia,
+                                               voti=voti, gruppo=gruppo, ruolo=ruolo)
+                    if pending and fascia:
+                        e["aventi_diritto_voto"] = [u["nome"] for u in fm.giocatori(db)]
+                        e["votanti"] = []
                     esiti.append(f"{m['nome']}: " + ("PENDING" if pending else f"{punti:+d}"))
             self.salva()
             pop.dismiss()
-            self.msg(("Proposta inviata: l'admin la confermerà dalla sezione Pending.\n" if proposta
+            self.msg(("Proposta inviata. I sondaggi sono segreti e si chiudono da soli quando hanno votato "
+                      "tutti; le proposte con punteggio fisso restano da confermare dall'admin.\n" if proposta
                       else "Registrato:\n") + "\n".join(esiti))
             self.render()
         si.bind(on_release=invia)
@@ -2779,27 +2817,24 @@ class FantaApp(App):
             g.add_widget(L("Nessun evento in pending.", wrap=True))
         for e in pend:
             m = next((x for x in self.db["musicisti"] if x["id"] == e["musicista_id"]), None)
-            voti = e.get("voti", [])
+            if e.get("proposta_base") is not None:
+                sotto = f"{e['data']} | proposto da {e.get('proposto_da', '?')}"
+                stato = "DA CONFERMARE"
+            elif e.get("fascia"):
+                fatti, necessari = fm.progresso_voti(self.db, e)
+                sotto = f"{e['data']} | voto segreto: {fatti}/{necessari} giocatori hanno votato"
+                stato = "SONDAGGIO"
+            else:
+                sotto = f"{e['data']} | pending"
+                stato = "PENDING"
             g.add_widget(self.riga(m.get("foto") if m else None, m["nome"] if m else "?",
                                    f"#{e['id']} {m['nome'] if m else '?'} - {e['azione']}",
-                                   f"{e['data']} | " + (f"proposto da {e['proposto_da']}" if e.get("proposto_da") else
-                                                        f"voti: {', '.join(map(str, voti)) or 'nessuno'}"),
-                                   "DA CONFERMARE" if e.get("proposta_base") is not None else "PENDING",
-                                   lambda e=e: self.f_pending(e)))
+                                   sotto, stato, lambda e=e: self.f_pending(e)))
         self.corpo.add_widget(sv)
 
     def f_pending(self, e):
         db = self.db
-        gruppo = fm.gruppo_voto(db, e, fm.eventi_pending(db))
         tutto_gruppo = [x for x in fm.eventi_pending(db) if e.get("gruppo") and x.get("gruppo") == e["gruppo"]] or [e]
-        az = next((a for a in db["azioni"] if a["id"] == e.get("azione_id")), None)
-        if e.get("fascia"):
-            lo, hi = e["fascia"]
-        elif (e.get("ruolo") or "") == "extra":
-            lo, hi = (1, 10)
-        else:
-            lo, hi = (az["min"], az["max"]) if az else (1, 10)
-        voti = list(e.get("voti", []))
         ha_proposta = e.get("proposta_base") is not None
         info = e["azione"]
         if e.get("da_approvare"):
@@ -2807,54 +2842,23 @@ class FantaApp(App):
         if ha_proposta:
             info += (f"\nPunteggio proposto: {fm.calcola_punti(e['proposta_base'], e['bonus']):+d} "
                      f"(base {e['proposta_base']})" + (f" - {e['dettaglio']}" if e.get("dettaglio") else ""))
+        elif e.get("fascia"):
+            fatti, necessari = fm.progresso_voti(db, e)
+            info += (f"\nSondaggio segreto: {fatti}/{necessari} giocatori aventi diritto hanno votato. "
+                     "I valori restano nascosti fino alla chiusura e l'evento si chiude automaticamente "
+                     "quando hanno votato tutti.")
+            if len(e.get("voti", [])) != len(e.get("votanti", [])):
+                info += ("\nATTENZIONE: questo pending contiene dati del vecchio sistema di votazione admin; "
+                         "per sicurezza non verrà auto-chiuso. Se serve, eliminalo e riproponilo.")
         else:
-            info += f" - voti finora: {', '.join(map(str, voti)) or 'nessuno'}" + \
-                    (f" (media {fm.media_voti(voti)})" if voti else "")
+            info += "\nEvento in pending."
         if len(tutto_gruppo) > 1:
             info += "\nL'evento vale per: " + ", ".join(fm.nome_musicista(db, x["musicista_id"]) for x in tutto_gruppo)
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
         sv, gi = scroll_list()
         gi.add_widget(L(info, wrap=True))
         box.add_widget(sv)
-        inp = None
-        if not ha_proposta:
-            inp = campo(hint=f"voti da aggiungere ({lo}-{hi}), spazio o virgola")
-            box.add_widget(inp)
         pop = self.popup(f"EVENTO #{e['id']}", box, 0.9, 0.85)
-
-        def applica(chiudi, azzera=False):
-            if azzera:
-                for x in gruppo:
-                    x["voti"], x["dettaglio"] = [], ""
-                self.finito(pop)
-                return
-            tot = list(voti)
-            if inp is not None and inp.text.strip():
-                nuovi = fm.parse_voti(inp.text, lo, hi)
-                if nuovi is None:
-                    self.msg(f"Inserisci interi da {lo} a {hi}.")
-                    return
-                tot += nuovi
-            if not tot:
-                self.msg("Nessun voto: l'evento resta in pending.")
-                return
-            if chiudi:
-                base, dett = fm.base_da_voti(tot)
-                for x in gruppo:
-                    x["voti"], x["base"], x["dettaglio"] = list(tot), base, dett
-                    punti = fm.calcola_punti(base, x["bonus"])
-                    if not x.get("dittatura"):
-                        mx = fm.musicista(db, x["musicista_id"])
-                        punti, x["bonus_auto"] = fm.applica_bonus_automatici(db, mx, punti) if mx else (punti, [])
-                    x["punti"] = punti
-                    x["stato"] = "ok"
-                    x["da_approvare"] = False
-                    x["data_completamento"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-            else:
-                for x in gruppo:
-                    x["voti"] = list(tot)
-                    x["dettaglio"] = f"voti finora: {', '.join(map(str, tot))}"
-            self.finito(pop)
 
         def conferma():
             adesso = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -2864,7 +2868,10 @@ class FantaApp(App):
                     punti = fm.calcola_punti(x["base"], x["bonus"])
                     if not x.get("dittatura"):
                         mx = fm.musicista(db, x["musicista_id"])
-                        punti, x["bonus_auto"] = fm.applica_bonus_automatici(db, mx, punti) if mx else (punti, [])
+                        giorno = (x.get("data") or "")[:10] or None
+                        punti, x["bonus_auto"] = fm.applica_bonus_automatici(
+                            db, mx, punti, proprietario=x.get("proprietario"), oggi=giorno
+                        ) if mx else (punti, [])
                     x["punti"] = punti
                     x["stato"], x["da_approvare"], x["data_completamento"] = "ok", False, adesso
             self.finito(pop)
@@ -2875,12 +2882,12 @@ class FantaApp(App):
                     db["eventi"].remove(x)
                     fm.riempi_buco(db, "eventi", "evento", x["id"])
             self.finito(pop)
+
         if ha_proposta:
             box.add_widget(NBtn("CONFERMA I PUNTI", on_release=lambda *_: conferma()))
-        else:
-            box.add_widget(NBtn("SALVA I VOTI (RESTA IN PENDING)", on_release=lambda *_: applica(False)))
-            box.add_widget(NBtn("CHIUDI L'EVENTO CON LA MEDIA", on_release=lambda *_: applica(True)))
-            box.add_widget(NBtn("AZZERA I VOTI", on_release=lambda *_: applica(False, True)))
+        elif e.get("fascia"):
+            box.add_widget(L("L'admin non può aggiungere, modificare, azzerare o chiudere manualmente i voti.",
+                             wrap=True, dim=11, colore="accent2", size_hint_y=None, height=dp(42)))
         if e.get("da_approvare"):
             box.add_widget(NBtn("RIFIUTA ED ELIMINA", colore=attenua(col("accent"), 0.7),
                                 on_release=lambda *_: rifiuta()))
