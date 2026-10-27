@@ -3,6 +3,10 @@ fantamusica_dati.json
 fantamusica_online.json
 fantamusica_dati.tmp
 *.bak
+*.html
+*.txt
+*.md
+foto/
 backup/
 esportazioni/
 

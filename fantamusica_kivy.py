@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FANTAMUSICA - versione grafica (Kivy) con stile retro-neon.
+FANTAMUSICA - applicazione principale (Kivy) con stile retro-neon.
 
-Usa la stessa logica e lo stesso file dati di fantamusica.py (che deve stare nella stessa
-cartella): puoi alternare versione testuale e grafica senza perdere nulla.
+La logica condivisa vive in fantamusica_core.py: non dipende più da fantamusica.py.
+Per giocare si avvia solo questa app; la modalità testuale è disponibile anche dentro Kivy
+con il pulsante MODALITÀ TERMINALE e usa gli stessi dati.
 
-Novita' rispetto alla versione testuale
+Funzioni principali
   - Foto per giocatori e musicisti (cartella "foto" accanto ai dati). Nelle liste compaiono come
     piccole miniature quadrate (max ~46 dp), nei profili al massimo 120 dp. Le foto importate
     vengono ritagliate quadrate e ridotte (se e' installato Pillow: pip install pillow).
@@ -15,17 +16,19 @@ Novita' rispetto alla versione testuale
   - Interfaccia a pulsanti: classifiche, squadre, profili, mercato e scambi, eventi, pending,
     asta, gestione musicisti e utenti, backup/CSV.
 
-Non ancora portato nella grafica (resta disponibile da fantamusica.py, stesso file dati):
-  gestione azioni, bonus/malus, caratteristiche dei profili, chiusura stagione, ripristino backup.
+Il pannello admin comprende anche gestione azioni, buff/debuff (bonus/malus), caratteristiche
+descrittive dei profili, chiusura stagione e ripristino backup.
 
-Gioco online (facoltativo): con il file fantamusica_online.json accanto ai dati, questa app pubblica
-lo stato del gioco su Supabase e applica le richieste dei giocatori che usano la pagina web
-(index.html). L'app dell'admin deve restare aperta durante il gioco. Vedi fm_online.py.
+Gioco online (facoltativo): con il file fantamusica_online.json accanto ai dati, questa app sincronizza
+lo stato locale con Supabase. Il gioco web continua anche quando l'app dell'admin è chiusa.
 
 Avvio:  pip install kivy pillow   ->   python3 fantamusica_kivy.py
 """
+import builtins
+import contextlib
 import copy
 import json
+import queue
 import os
 import re
 import secrets
@@ -73,7 +76,7 @@ try:
 except ImportError:  # senza Pillow le foto vengono copiate cosi' come sono
     PILImage = None
 
-import fantamusica as fm
+import fantamusica_core as fm
 import fm_online as fo
 
 # --------------------------------------------------------------------------
@@ -92,8 +95,9 @@ TEMI = {
 }
 GIALLO = (0.26, 0.20, 0.02)       # sfondo delle righe degli eventi con più musicisti coinvolti
 EV_PAGINA = 200                   # righe per pagina negli elenchi lunghi (le righe sono widget veri)
-CAMPI_GUI = [("Strumento", "testo"), ("Solista", "sino"), ("Carica/Scarica", "sino"),
-             ("Archivista", "sino"), ("Presentatore", "sino")]
+# Le caratteristiche sono ora solo dati descrittivi del profilo. Gli stati temporanei o di gioco
+# (es. Solista, Carica/Scarica, ecc.) vanno modellati come buff/debuff, non ricreati automaticamente.
+CAMPI_GUI = []
 SCALE = {"PICCOLO": 0.85, "MEDIO": 1.0, "GRANDE": 1.2, "MOLTO GRANDE": 1.4}
 ASPETTO_BASE = {"tema": "verde", "scanlines": False, "scala": 1.2}
 
@@ -119,14 +123,12 @@ def attenua(c, f=0.55):
 
 
 def assicura_campi(db):
-    """Aggiunge ai musicisti le caratteristiche Strumento, Solista, Carica/Scarica, Archivista, Presentatore
-    (si/no = tipo 'sino') se mancano. Ritorna True se ha modificato qualcosa."""
-    cambiato = False
-    for nome, tipo in CAMPI_GUI:
-        if not any(c["per"] == "musicisti" and c["nome"].lower() == nome.lower() for c in db["campi"]):
-            db["campi"].append({"id": fm.prossimo_id(db, "campo"), "per": "musicisti", "nome": nome, "tipo": tipo})
-            cambiato = True
-    return cambiato
+    """Compatibilità con i salvataggi precedenti.
+
+    Le caratteristiche descrittive vengono create dal core; Kivy non aggiunge più automaticamente
+    caratteristiche che rappresentano stati di gioco, perché ora quelli sono buff/debuff.
+    """
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -501,6 +503,8 @@ class FantaApp(App):
         self.stack = []
         self.righe_login = []
         self.live = None
+        self.terminale_attivo = False
+        self.terminale_coda = None
         self._poll = self._conto_ev = None
         self._bg = self._scan = None
         # gioco online (Supabase)
@@ -714,8 +718,11 @@ class FantaApp(App):
             if self.db is not None:
                 try:
                     fm.crea_backup(self.db, "prima-del-download-online")
-                except OSError:
-                    pass
+                except OSError as e:
+                    self.onl_busy = False
+                    self.msg(f"Download annullato: non riesco a creare il backup di sicurezza ({e.strerror or e}).\n"
+                             "I dati locali NON sono stati sostituiti.")
+                    return
                 self.db.clear()
                 self.db.update(copy.deepcopy(dati))
             else:
@@ -761,7 +768,7 @@ class FantaApp(App):
 
     def online_tick(self, *_):
         """Ogni pochi secondi: guarda la versione online; pubblica le modifiche fatte qui oppure prende le novità."""
-        if not self.onl or self.onl_busy or self.db is None:
+        if not self.onl or self.onl_busy or self.db is None or getattr(self, "terminale_attivo", False):
             return
         if self.onl_stadio == "avvio":
             self.onl_busy = True
@@ -1207,7 +1214,8 @@ class FantaApp(App):
                 ("LA MIA SQUADRA", lambda: self.vai(self.v_squadra, me["nome"])),
                 ("REGISTRA EVENTO" if self.e_admin() else "PROPONI UN EVENTO", lambda: self.f_evento(False)),
                 ("MERCATO E SCAMBI", lambda: self.vai(self.v_mercato)),
-                ("ASPETTO E PREFERENZE", lambda: self.vai(self.v_aspetto))]
+                ("ASPETTO E PREFERENZE", lambda: self.vai(self.v_aspetto)),
+                ("MODALITÀ TERMINALE", self.apri_terminale)]
         if self.e_admin():
             voci.append(("PANNELLO ADMIN", lambda: self.vai(self.v_admin)))
         voci.append(("CAMBIA ACCOUNT / ESCI", self.esci_account))
@@ -1308,6 +1316,10 @@ class FantaApp(App):
                                    f"{nome} - {ruolo}" if ruolo else nome,
                                    " | ".join(filter(None, [x["proprietario"] or "nessuna squadra", calcolo])),
                                    pts, sfondo=GIALLO if x["id"] == e["id"] and len(gruppo) > 1 else None))
+            effetti = list(x.get("bonus", [])) + list(x.get("bonus_auto", []))
+            if effetti:
+                g.add_widget(L("Buff/debuff: " + "; ".join(fm.descrivi_bonus_esteso(z) for z in effetti),
+                               dim=10, wrap=True, colore="accent2"))
         box.add_widget(sv)
         if len(gruppo) > 1:
             box.add_widget(L(f"Totale evento: {fmt_pt(tot)} punti", dim=14, colore="accent2", bold=True,
@@ -1404,9 +1416,20 @@ class FantaApp(App):
         info.add_widget(L(f"{tot_ut.get(nome, 0)} punti", dim=16, colore="accent2"))
         info.add_widget(L(f"crediti {fm.crediti(db, nome)}/{s['budget_iniziale']}", dim=12))
         info.add_widget(L(f"musicisti {len(r)}/{s['musicisti_per_squadra']}", dim=12))
+        for c in fm.campi_per(db, "giocatori"):
+            val = fm.valore_profilo(u, c)
+            if val != "-":
+                info.add_widget(L(f"{c['nome']}: {val}", dim=11))
         top.add_widget(info)
         fissa_info(top, info)
         g.add_widget(top)
+        buff_giocatore = [b for b in db["bonus"]
+                          if b.get("bersaglio") == "giocatore" and b.get("giocatore") == nome
+                          and fm.bonus_attivo(b, datetime.now().strftime("%Y-%m-%d"))]
+        if buff_giocatore:
+            self.sezione(g, "BUFF / DEBUFF ATTIVI")
+            for b in buff_giocatore:
+                g.add_widget(L(fm.descrivi_bonus_esteso(b), dim=11, wrap=True))
         if self.me is u or self.e_admin():
             r2 = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
             r2.add_widget(NBtn("CAMBIA FOTO", dim=11, height=dp(40), on_release=lambda *_: self.cambia_foto(u, "g")))
@@ -1454,6 +1477,19 @@ class FantaApp(App):
         top.add_widget(info)
         fissa_info(top, info)
         g.add_widget(top)
+        oggi = datetime.now().strftime("%Y-%m-%d")
+        buff_diretti = [b for b in db["bonus"]
+                        if b.get("bersaglio") == "musicista" and b.get("musicista_id") == m["id"]
+                        and fm.bonus_attivo(b, oggi)]
+        buff_squadra = [b for b in db["bonus"]
+                        if b.get("bersaglio") == "giocatore" and m.get("proprietario")
+                        and b.get("giocatore") == m.get("proprietario") and fm.bonus_attivo(b, oggi)]
+        if buff_diretti or buff_squadra:
+            self.sezione(g, "BUFF / DEBUFF ATTIVI")
+            for b in buff_diretti:
+                g.add_widget(L(fm.descrivi_bonus_esteso(b), dim=11, wrap=True))
+            for b in buff_squadra:
+                g.add_widget(L("Di squadra: " + fm.descrivi_bonus_esteso(b), dim=11, wrap=True))
         g.add_widget(NBtn("IL MIO SOPRANNOME PER QUESTO MUSICISTA", dim=11, height=dp(40),
                           on_release=lambda *_: self.f_mio_soprannome(m)))
         if self.e_admin():
@@ -1506,7 +1542,7 @@ class FantaApp(App):
         campi = fm.campi_per(self.db, per)
         if not campi:
             self.msg("Nessuna caratteristica definita (si creano dalla versione testuale: "
-                     "Pannello admin > Caratteristiche dei profili).")
+                     "Pannello admin > Caratteristiche descrittive).")
             return
 
         def ok(v):
@@ -1552,6 +1588,9 @@ class FantaApp(App):
             return
         if any(e["musicista_id"] == m["id"] for e in db["eventi"]):
             self.msg("Ha eventi registrati: eliminali prima oppure lascialo in elenco.")
+            return
+        if any(b.get("bersaglio") == "musicista" and b.get("musicista_id") == m["id"] for b in db["bonus"]):
+            self.msg("Ha un bonus/malus automatico collegato: eliminalo o spostalo prima.")
             return
 
         def ok():
@@ -1905,6 +1944,565 @@ class FantaApp(App):
             ("r", "Rilancio minimo", s["rilancio_minimo"], {}),
             ("x", "Scambi a testa per stagione", s.get("scambi_max", fm.SCAMBI_PREDEFINITI), {})], ok)
 
+    # ---------- modalità terminale interna ----------
+    def apri_terminale(self):
+        """Apre la vecchia esperienza a menu numerici dentro la finestra Kivy.
+
+        Non avvia fantamusica.py: esegue il motore condiviso in un thread e collega input/output
+        a due widget Kivy. Durante la sessione la sincronizzazione automatica viene sospesa per
+        evitare che i dati cambino sotto un menu in corso.
+        """
+        if self.terminale_attivo:
+            return
+        self.stack = [(self.v_terminale, ())]
+        self.render()
+
+    def v_terminale(self):
+        self.titolo("MODALITÀ TERMINALE")
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(4))
+        out = TextInput(text="", readonly=True, multiline=True, font_name=FONT, font_size=fs(13),
+                        background_normal="", background_active="", background_color=(*col("bg1"), 0.96),
+                        foreground_color=(*col("testo"), 1), cursor_color=(*col("accent"), 1))
+        inp = campo("", hint="Scrivi il numero o la risposta e premi INVIO")
+        box.add_widget(out)
+        box.add_widget(L("Qui non servono pulsanti: usa i menu numerici come nel terminale. Con 0 torni indietro/esci.",
+                         dim=11, colore="accent2", wrap=True, size_hint_y=None, height=dp(42)))
+        box.add_widget(inp)
+        self.corpo.add_widget(box)
+
+        # v_terminale può essere richiamata da un ridisegno: il processo si avvia una sola volta.
+        if self.terminale_attivo:
+            return
+        self.terminale_attivo = True
+        self.terminale_coda = queue.Queue()
+
+        class Writer:
+            def __init__(self, app):
+                self.app = app
+            def write(self, testo):
+                if not testo:
+                    return 0
+                def aggiungi(_dt, t=testo):
+                    if not self.app.terminale_attivo:
+                        return
+                    out.text = (out.text + t)[-60000:]
+                    out.cursor = (len(out.text), 0)
+                    out.scroll_y = 0
+                Clock.schedule_once(aggiungi, 0)
+                return len(testo)
+            def flush(self):
+                pass
+
+        writer = Writer(self)
+
+        def invia(*_):
+            testo = inp.text
+            inp.text = ""
+            if self.terminale_coda is not None:
+                self.terminale_coda.put(testo)
+        inp.bind(on_text_validate=invia)
+        Clock.schedule_once(lambda _dt: setattr(inp, "focus", True), 0.1)
+
+        def leggi(prompt="", password=False):
+            writer.write(prompt)
+            valore = self.terminale_coda.get()
+            writer.write(("*" * len(valore) if password else valore) + "\n")
+            return valore
+
+        def finito(_dt=0):
+            self.terminale_attivo = False
+            self.terminale_coda = None
+            # Il motore ha già salvato le singole operazioni; questo passaggio segnala anche
+            # alla sincronizzazione online che il database locale può essere cambiato.
+            self.me = fm.utente(self.db, self.me["nome"]) or self.me
+            self.g = fm.Gioco(self.db, self.me)
+            self.salva()
+            self.stack = [(self.v_home, ())]
+            self.render()
+
+        def esegui():
+            vecchio_input = builtins.input
+            vecchio_getpass = fm.getpass.getpass
+            try:
+                builtins.input = lambda prompt="": leggi(prompt, False)
+                fm.getpass.getpass = lambda prompt="": leggi(prompt, True)
+                with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                    fm.Gioco(self.db, self.me).avvia()
+            except Exception as e:
+                writer.write(f"\n[ERRORE MODALITÀ TERMINALE: {e}]\n")
+            finally:
+                builtins.input = vecchio_input
+                fm.getpass.getpass = vecchio_getpass
+                Clock.schedule_once(finito, 0)
+
+        threading.Thread(target=esegui, daemon=True).start()
+
+    # ---------- gestione azioni (GUI) ----------
+    def v_gest_azioni(self):
+        if not self._solo_admin:
+            return self.indietro()
+        self.titolo("GESTIONE AZIONI")
+        sv, g = scroll_list(8)
+        g.add_widget(NBtn("+ NUOVA AZIONE", on_release=lambda *_: self.f_azione_gui()))
+        g.add_widget(NBtn("ELIMINA AZIONE", colore=attenua(col("accent"), 0.75),
+                          on_release=lambda *_: self.f_elimina_azione_gui()))
+        for a in sorted(self.db["azioni"], key=lambda x: x["id"]):
+            sotto = f"{a.get('modalita', 'fisso')}  //  {fm.descrivi_punteggio(a)}"
+            if a.get("bonus_ids"):
+                sotto += f"  // bonus: {', '.join(map(str, a['bonus_ids']))}"
+            g.add_widget(self.riga(None, a["nome"], f"#{a['id']}  {a['nome']}", sotto,
+                                   azione=lambda a=a: self.f_azione_gui(a), h=66))
+        self.corpo.add_widget(sv)
+
+    @staticmethod
+    def _testo_slot_azione(a):
+        parti = []
+        for i, s in enumerate(fm.slot_azione(a)):
+            ruolo = s.get("ruolo") or ("principale" if i == 0 else f"ruolo{i+1}")
+            valore = f"{s.get('min')}-{s.get('max')}" if a.get("modalita") == "sondaggio" else str(s.get("punti", 0))
+            parti.append(f"{ruolo}={valore}")
+        return "; ".join(parti)
+
+    def _parse_slot_azione_gui(self, testo, modalita):
+        slot = []
+        for n, pezzo in enumerate(testo.split(";"), 1):
+            pezzo = pezzo.strip()
+            if not pezzo:
+                continue
+            if "=" not in pezzo:
+                raise ValueError("Usa il formato ruolo=valore, separando i musicisti con ';'.")
+            ruolo, valore = (x.strip() for x in pezzo.split("=", 1))
+            if ruolo.lower() == "principale":
+                ruolo = ""
+            if modalita == "sondaggio":
+                fascia = fm.parse_range(valore)
+                if not fascia:
+                    raise ValueError(f"Range non valido nello slot {n}: usa per esempio 1-10.")
+                punti, lo, hi = 0, fascia[0], fascia[1]
+            else:
+                try:
+                    punti = int(valore)
+                except ValueError:
+                    raise ValueError(f"Punteggio non valido nello slot {n}: serve un intero.")
+                lo = hi = None
+            slot.append({"ruolo": ruolo, "punti": punti, "min": lo, "max": hi})
+        if not slot:
+            raise ValueError("Definisci almeno il musicista principale.")
+        ruoli = [x["ruolo"].lower() for x in slot if x["ruolo"]]
+        if len(ruoli) != len(set(ruoli)):
+            raise ValueError("I ruoli devono essere diversi tra loro.")
+        return slot
+
+    def f_azione_gui(self, a=None):
+        db = self.db
+        nuova = a is None
+        if nuova:
+            a = fm.nuova_azione(0, "", 0)
+        bonus_txt = ",".join(map(str, a.get("bonus_ids", [])))
+        intro = ("Slot: scrivi per esempio 'principale=10; ospite=5'. Per un sondaggio usa "
+                 "'principale=1-10; ospite=1-5'. In modalità tempo i valori sono punti per unità. "
+                 "Gli eventi già registrati conservano il punteggio storico.")
+
+        def ok(v):
+            nome = " ".join(v["nome"].split())
+            if not nome:
+                self.msg("Il nome dell'azione è obbligatorio.")
+                return False
+            if any(x is not a and x["nome"].lower() == nome.lower() for x in db["azioni"]):
+                self.msg("Esiste già un'azione con questo nome.")
+                return False
+            modalita = v["modalita"]
+            try:
+                slot = self._parse_slot_azione_gui(v["slot"], modalita)
+            except ValueError as e:
+                self.msg(str(e))
+                return False
+            bonus_ids = fm.parse_ids(v["bonus"], {b["id"] for b in db["bonus"]}) if v["bonus"].strip() else []
+            if bonus_ids is None:
+                self.msg("La lista bonus contiene ID non validi.")
+                return False
+            vecchio_nome = a.get("nome")
+            if nuova:
+                a["id"] = fm.prossimo_id(db, "azione")
+                db["azioni"].append(a)
+            a["nome"], a["modalita"] = nome, modalita
+            a["unita"] = (v["unita"].strip() or "ore") if modalita == "tempo" else None
+            a.update(slot[0])
+            a["extra"] = slot[1:]
+            a["bonus_ids"] = bonus_ids
+            if not nuova and vecchio_nome != nome:
+                for e in db["eventi"]:
+                    if e.get("azione_id") == a["id"]:
+                        e["azione"] = nome
+            self.salva(); self.render()
+
+        self.form("NUOVA AZIONE" if nuova else f"AZIONE #{a['id']}", [
+            ("nome", "Nome", a.get("nome", ""), {}),
+            ("modalita", "Modalità", a.get("modalita", "fisso"), {"valori": ["fisso", "sondaggio", "tempo"]}),
+            ("unita", "Unità (solo modalità tempo)", a.get("unita") or "ore", {}),
+            ("slot", "Musicisti/ruoli e punteggi", self._testo_slot_azione(a), {}),
+            ("bonus", "ID bonus/malus collegati (es. 1,3,4)", bonus_txt, {}),
+        ], ok, intro=intro, h=0.9)
+
+    def f_elimina_azione_gui(self):
+        def ok(v):
+            if not v["id"].isdigit():
+                self.msg("Scrivi un ID numerico."); return False
+            a = next((x for x in self.db["azioni"] if x["id"] == int(v["id"])), None)
+            if not a:
+                self.msg("Azione inesistente."); return False
+            def elimina():
+                for e in self.db["eventi"]:
+                    if e.get("azione_id") == a["id"]:
+                        e["azione_id"] = None
+                self.db["azioni"].remove(a)
+                fm.riempi_buco(self.db, "azioni", "azione", a["id"])
+                self.salva(); self.render()
+            self.conferma(f"Eliminare '{a['nome']}'? Gli eventi storici conservano nome e punti.", elimina)
+        self.form("ELIMINA AZIONE", [("id", "ID azione", "", {})], ok, h=0.45)
+
+    # ---------- gestione bonus/malus (GUI) ----------
+    def v_gest_bonus(self):
+        if not self._solo_admin:
+            return self.indietro()
+        self.titolo("BONUS E MALUS")
+        sv, g = scroll_list(8)
+        g.add_widget(NBtn("+ NUOVO BONUS/MALUS", on_release=lambda *_: self.f_bonus_gui()))
+        g.add_widget(NBtn("ELIMINA BONUS/MALUS", colore=attenua(col("accent"), 0.75),
+                          on_release=lambda *_: self.f_elimina_bonus_gui()))
+        for b in sorted(self.db["bonus"], key=lambda x: x["id"]):
+            bers = b.get("bersaglio", "azione")
+            dest = (fm.nome_musicista(self.db, b.get("musicista_id")) if bers == "musicista" else
+                    b.get("giocatore") if bers == "giocatore" else "tipi di evento selezionati")
+            bers_ui = "evento" if bers == "azione" else bers
+            durata = b.get("durata", "permanente")
+            durata_ui = "a tempo" if durata in ("a_tempo", "date") else durata
+            sotto = f"{fm.descrivi_bonus_esteso(b)} // {bers_ui}: {dest or '-'} // durata {durata_ui}"
+            g.add_widget(self.riga(None, b["nome"], f"#{b['id']}  {b['nome']}", sotto,
+                                   azione=lambda b=b: self.f_bonus_gui(b), h=66))
+        self.corpo.add_widget(sv)
+
+    def f_bonus_gui(self, b=None):
+        """Crea/modifica un buff o debuff senza chiedere ID all'admin.
+
+        Nell'interfaccia il bersaglio tecnico ``azione`` viene chiamato ``evento``: il buff/debuff
+        viene scelto durante la registrazione dell'evento ed è disponibile solo per i tipi di evento
+        spuntati qui sotto. Musicisti e giocatori, invece, lo ricevono automaticamente finché è attivo.
+        """
+        db = self.db
+        nuovo = b is None
+        if nuovo:
+            b = {"id": 0, "nome": "", "tipo": "punti", "valore": 1, "descrizione": "",
+                 "bersaglio": "azione", "musicista_id": None, "giocatore": None,
+                 "durata": "permanente", "eventi_rimasti": None, "da": None, "a": None}
+
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        sv, g = scroll_list(8)
+        g.add_widget(L("I buff/debuff degli eventi si scelgono quando registri l'evento; quelli di musicisti e "
+                       "giocatori si applicano automaticamente. La descrizione è facoltativa e compare nelle "
+                       "schede e nei dettagli degli eventi.", wrap=True, colore="accent2"))
+
+        righe = {}
+        campi = {}
+
+        def aggiungi_campo(chiave, etichetta, widget, altezza=68):
+            r = BoxLayout(orientation="vertical", spacing=dp(3), size_hint_y=None, height=dp(altezza))
+            r.add_widget(L(etichetta, dim=12, size_hint_y=None, height=dp(20), colore="accent2"))
+            r.add_widget(widget)
+            g.add_widget(r)
+            righe[chiave] = (r, dp(altezza))
+            campi[chiave] = widget
+            return widget
+
+        def mostra(chiave, si):
+            r, h = righe[chiave]
+            r.height = h if si else 0
+            r.opacity = 1 if si else 0
+            r.disabled = not si
+
+        nome_w = aggiungi_campo("nome", "Nome", campo(b.get("nome", "")))
+        valore_iniziale = fm.fmt_segno(b.get("valore", 0)) + ("%" if b.get("tipo") == "percentuale" else "")
+        valore_w = aggiungi_campo("valore", "Valore (+5, -3, 20%, -10%)", campo(valore_iniziale))
+        desc_w = TextInput(text=str(b.get("descrizione") or ""), multiline=True, font_name=FONT, font_size=fs(13),
+                           background_normal="", background_active="", background_color=(*col("bg1"), 1),
+                           foreground_color=(*col("testo"), 1), cursor_color=(*col("accent"), 1),
+                           hint_text="Descrizione facoltativa", hint_text_color=(*col("testo"), 0.35),
+                           size_hint_y=None, height=dp(72), padding=[dp(8), dp(8)], write_tab=False)
+        aggiungi_campo("descrizione", "Descrizione / caratteristica del buff o debuff", desc_w, 100)
+
+        bers_iniziale = "evento" if b.get("bersaglio", "azione") == "azione" else b.get("bersaglio")
+        bers_w = aggiungi_campo("bersaglio", "Si applica a", spinner(bers_iniziale,
+                                      ["evento", "musicista", "giocatore"]))
+
+        # Il destinatario è uno spinner: niente ID o nomi da ricordare/scrivere.
+        dest_w = aggiungi_campo("dest", "Destinatario", spinner("-", ["-"]))
+
+        durata_db = b.get("durata", "permanente")
+        durata_ui = "a tempo" if durata_db in ("a_tempo", "date") else durata_db
+        durata_w = aggiungi_campo("durata", "Durata", spinner(durata_ui,
+                                        ["permanente", "eventi", "a tempo"]))
+        eventi_w = aggiungi_campo("eventi", "Numero di eventi", campo(str(b.get("eventi_rimasti") or ""),
+                                                                         input_filter="int"))
+        da_w = aggiungi_campo("da", "Dal (AAAA-MM-GG)", campo(str(b.get("da") or "")))
+        a_w = aggiungi_campo("a", "Al (AAAA-MM-GG)", campo(str(b.get("a") or "")))
+
+        titolo_azioni = L("TIPI DI EVENTO IN CUI È DISPONIBILE", dim=12, colore="accent2",
+                          bold=True, size_hint_y=None, height=dp(28))
+        g.add_widget(titolo_azioni)
+        azione_righe = []
+        azione_cb = {}
+        for az in sorted(db["azioni"], key=lambda x: x["nome"].lower()):
+            r = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(8))
+            cb = CheckBox(active=(not nuovo and b.get("id") in az.get("bonus_ids", [])),
+                          size_hint=(None, None), size=(dp(36), dp(36)))
+            r.add_widget(cb)
+            r.add_widget(L(az["nome"], dim=11, wrap=True))
+            g.add_widget(r)
+            azione_righe.append(r)
+            azione_cb[az["id"]] = cb
+
+        def mostra_azioni(si):
+            titolo_azioni.height = dp(28) if si else 0
+            titolo_azioni.opacity = 1 if si else 0
+            titolo_azioni.disabled = not si
+            for r in azione_righe:
+                r.height = dp(38) if si else 0
+                r.opacity = 1 if si else 0
+                r.disabled = not si
+
+        def sync_durata(*_):
+            automatico = bers_w.text in ("musicista", "giocatore")
+            mostra("durata", automatico)
+            mostra("eventi", automatico and durata_w.text == "eventi")
+            temporaneo = automatico and durata_w.text == "a tempo"
+            mostra("da", temporaneo)
+            mostra("a", temporaneo)
+
+        def sync_bersaglio(*_):
+            bers = bers_w.text
+            evento = bers == "evento"
+            mostra_azioni(evento)
+            mostra("dest", not evento)
+            if bers == "musicista":
+                nomi = [m["nome"] for m in sorted(db["musicisti"], key=lambda x: x["nome"].lower())]
+                corrente = fm.nome_musicista(db, b.get("musicista_id")) if b.get("musicista_id") else None
+            elif bers == "giocatore":
+                nomi = [u["nome"] for u in sorted(db["utenti"], key=lambda x: x["nome"].lower()) if u.get("gioca")]
+                corrente = b.get("giocatore")
+            else:
+                nomi, corrente = [], None
+            valori = nomi or ["-"]
+            dest_w.values = valori
+            if corrente in valori:
+                dest_w.text = corrente
+            elif dest_w.text not in valori:
+                dest_w.text = valori[0]
+            sync_durata()
+
+        bers_w.bind(text=sync_bersaglio)
+        durata_w.bind(text=sync_durata)
+        sync_bersaglio()
+
+        box.add_widget(sv)
+        pulsanti = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
+        annulla = NBtn("ANNULLA", colore=attenua(col("accent"), 0.7))
+        salva = NBtn("SALVA")
+        pulsanti.add_widget(annulla); pulsanti.add_widget(salva)
+        box.add_widget(pulsanti)
+        pop = self.popup("NUOVO BONUS/MALUS" if nuovo else f"BONUS #{b['id']}", box, 0.94, 0.94)
+        annulla.bind(on_release=lambda *_: pop.dismiss())
+
+        def invia(*_):
+            nome = " ".join(nome_w.text.split())
+            valore = fm.parse_bonus(valore_w.text.strip())
+            if not nome or valore is None:
+                self.msg("Nome o valore del bonus/malus non valido."); return
+            if any(x is not b and x["nome"].lower() == nome.lower() for x in db["bonus"]):
+                self.msg("Esiste già un bonus/malus con questo nome."); return
+
+            bers_ui = bers_w.text
+            bers = "azione" if bers_ui == "evento" else bers_ui
+            mid = None; gioc = None
+            if bers == "musicista":
+                m = next((x for x in db["musicisti"] if x["nome"] == dest_w.text), None)
+                if not m:
+                    self.msg("Scegli un musicista dall'elenco."); return
+                mid = m["id"]
+            elif bers == "giocatore":
+                u = next((x for x in db["utenti"] if x["nome"] == dest_w.text and x.get("gioca")), None)
+                if not u:
+                    self.msg("Scegli un giocatore dall'elenco."); return
+                gioc = u["nome"]
+
+            durata = "permanente"
+            rimasti = da = a_data = None
+            if bers != "azione":
+                durata = "a_tempo" if durata_w.text == "a tempo" else durata_w.text
+                if durata == "eventi":
+                    if not eventi_w.text.strip().isdigit() or int(eventi_w.text.strip()) <= 0:
+                        self.msg("Per la durata 'eventi' serve un numero maggiore di zero."); return
+                    rimasti = int(eventi_w.text.strip())
+                elif durata == "a_tempo":
+                    da = da_w.text.strip() or None
+                    a_data = a_w.text.strip() or None
+                    for etichetta, x in (("iniziale", da), ("finale", a_data)):
+                        if x:
+                            try:
+                                datetime.strptime(x, "%Y-%m-%d")
+                            except ValueError:
+                                self.msg(f"La data {etichetta} deve essere una data reale nel formato AAAA-MM-GG.")
+                                return
+                    if da and a_data and da > a_data:
+                        self.msg("La data iniziale non può essere dopo quella finale."); return
+
+            if nuovo:
+                b["id"] = fm.prossimo_id(db, "bonus")
+                db["bonus"].append(b)
+            for az in db["azioni"]:
+                az["bonus_ids"] = [i for i in az.get("bonus_ids", []) if i != b["id"]]
+            b.update(nome=nome, tipo=valore[0], valore=valore[1],
+                     descrizione=desc_w.text.strip()[:240], bersaglio=bers,
+                     musicista_id=mid, giocatore=gioc, durata=durata,
+                     eventi_rimasti=rimasti, da=da, a=a_data)
+            if bers == "azione":
+                for az in db["azioni"]:
+                    if azione_cb[az["id"]].active:
+                        az["bonus_ids"].append(b["id"])
+            pop.dismiss()
+            self.salva(); self.render()
+
+        salva.bind(on_release=invia)
+
+    def f_elimina_bonus_gui(self):
+        def ok(v):
+            if not v["id"].isdigit(): self.msg("Scrivi un ID numerico."); return False
+            b = next((x for x in self.db["bonus"] if x["id"] == int(v["id"])), None)
+            if not b: self.msg("Bonus/malus inesistente."); return False
+            def elimina():
+                for a in self.db["azioni"]:
+                    a["bonus_ids"] = [i for i in a.get("bonus_ids", []) if i != b["id"]]
+                self.db["bonus"].remove(b)
+                fm.riempi_buco(self.db, "bonus", "bonus", b["id"])
+                self.salva(); self.render()
+            self.conferma(f"Eliminare '{b['nome']}' e scollegarlo dalle azioni?", elimina)
+        self.form("ELIMINA BONUS/MALUS", [("id", "ID bonus/malus", "", {})], ok, h=0.45)
+
+    # ---------- caratteristiche dei profili (GUI) ----------
+    def v_gest_campi(self):
+        if not self._solo_admin:
+            return self.indietro()
+        self.titolo("CARATTERISTICHE DESCRITTIVE")
+        sv, g = scroll_list(8)
+        g.add_widget(NBtn("+ NUOVA CARATTERISTICA", on_release=lambda *_: self.f_campo_gui()))
+        for c in sorted(self.db["campi"], key=lambda x: x["id"]):
+            g.add_widget(self.riga(None, c["nome"], f"#{c['id']}  {c['nome']}",
+                                   f"{c['per']} // tipo {c['tipo']}",
+                                   azione=lambda c=c: self.f_campo_gui(c), h=60))
+        self.corpo.add_widget(sv)
+
+    def f_campo_gui(self, c=None):
+        db = self.db; nuovo = c is None
+        if nuovo: c = {"id": 0, "per": "musicisti", "nome": "", "tipo": "testo"}
+        def ok(v):
+            nome = " ".join(v["nome"].split())
+            if not nome: self.msg("Il nome è obbligatorio."); return False
+            if any(x is not c and x["per"] == v["per"] and x["nome"].lower() == nome.lower() for x in db["campi"]):
+                self.msg("Esiste già una caratteristica con questo nome per quel tipo di profilo."); return False
+            if nuovo:
+                c["id"] = fm.prossimo_id(db, "campo"); db["campi"].append(c)
+            c.update(nome=nome, per=v["per"], tipo=v["tipo"])
+            self.salva(); self.render()
+        p = self.form("NUOVA CARATTERISTICA" if nuovo else f"CARATTERISTICA #{c['id']}", [
+            ("nome", "Nome", c["nome"], {}),
+            ("per", "Profilo", c["per"], {"valori": ["musicisti", "giocatori"]}),
+            ("tipo", "Tipo", c["tipo"], {"valori": ["testo", "numero", "sino"]}),
+        ], ok, h=0.65)
+        if not nuovo:
+            # Pulsante di eliminazione dentro la stessa finestra, sotto i campi.
+            elimina = NBtn("ELIMINA CARATTERISTICA", colore=(1, .45, .45), height=dp(44))
+            p.content.add_widget(elimina)
+            def chiedi(*_):
+                p.dismiss()
+                compilati = [x for x in fm.profili_di(db, c["per"]) if str(c["id"]) in x.get("profilo", {})]
+                def esegui():
+                    for x in compilati: x.get("profilo", {}).pop(str(c["id"]), None)
+                    db["campi"].remove(c); fm.riempi_buco(db, "campi", "campo", c["id"])
+                    self.salva(); self.render()
+                self.conferma(f"Eliminare '{c['nome']}'? Verranno cancellati {len(compilati)} valori già compilati.", esegui)
+            elimina.bind(on_release=chiedi)
+
+    # ---------- chiusura stagione ----------
+    def f_chiudi_stagione_gui(self):
+        if not self._solo_admin: return
+        db = self.db; s = db["impostazioni"]
+        pend = len(fm.eventi_pending(db))
+        intro = (f"Stai chiudendo '{s['stagione']}'. Verranno archiviati classifica, eventi validi e scambi accettati; "
+                 f"squadre, crediti ed eventi ripartono da zero. Pending attuali: {pend}. Scrivi CHIUDI per confermare.")
+        def ok(v):
+            if v["conferma"] != "CHIUDI": self.msg("Conferma non valida: scrivi esattamente CHIUDI."); return False
+            try:
+                backup = fm.crea_backup(db, "chiusura-stagione")
+            except OSError as e:
+                self.msg(f"Chiusura annullata: non riesco a creare il backup ({e.strerror or e}).")
+                return False
+            cl = fm.classifica_giocatori(db); clm = fm.classifica_musicisti(db)
+            db["storico"].append({
+                "id": fm.prossimo_id(db, "stagione"), "nome": s["stagione"],
+                "chiusa": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "classifica": [{"pos": pos, "nome": n, "punti": p, "musicisti": [m["nome"] for m in fm.rosa(db, n)]}
+                               for pos, n, p in cl],
+                "musicisti": [{"pos": pos, "nome": m["nome"], "squadra": m["proprietario"], "punti": p}
+                              for pos, m, p in clm],
+                "eventi": copy.deepcopy(fm.eventi_ok(db)),
+                "scambi": copy.deepcopy([x for x in db["scambi"] if x["stato"] == "accettato"]),
+            })
+            db["eventi"].clear(); db["scambi"].clear()
+            # Gli ID non vengono riciclati: i contatori restano monotoni anche tra una stagione e l'altra.
+            for m in db["musicisti"]: m["proprietario"], m["prezzo"] = None, 0
+            for u in db["utenti"]: u["saldo"] = 0
+            s["stagione"] = v["nome"].strip() or f"Stagione {len(db['storico']) + 1}"
+            self.salva(); self.render(); self.msg(f"Stagione archiviata. Backup: {backup}")
+        self.form("CHIUDI STAGIONE", [("nome", "Nome nuova stagione", f"Stagione {len(db['storico']) + 1}", {}),
+                                      ("conferma", "Scrivi CHIUDI", "", {})], ok, intro=intro, h=0.65)
+
+    # ---------- ripristino backup ----------
+    def v_ripristina_backup(self):
+        if not self._solo_admin: return
+        backups = fm.elenco_backup()
+        if not backups:
+            self.msg("Non ci sono backup disponibili."); return
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        sv, g = scroll_list(6)
+        for path in backups:
+            def scegli(p=path):
+                pop.dismiss()
+                def ripristina():
+                    nuovo, err = fm.leggi_database(p)
+                    if err:
+                        self.msg(err); return
+                    try:
+                        fm.crea_backup(self.db, "prima-del-ripristino")
+                    except OSError as e:
+                        self.msg(f"Ripristino annullato: backup di sicurezza non riuscito ({e.strerror or e}).")
+                        return
+                    nome = self.me["nome"] if self.me else None
+                    self.db.clear(); self.db.update(nuovo); fm.salva(self.db)
+                    self.me = fm.utente(self.db, nome) if nome else None
+                    if not self.me:
+                        self.g = None; self.stack = [(self.v_login, ())]
+                    else:
+                        self.g = fm.Gioco(self.db, self.me); self.stack = [(self.v_home, ())]
+                    if self.onl: self.onl_sporco = True
+                    self.render(); self.msg(f"Ripristinato: {p.name}")
+                self.conferma(f"Ripristinare '{p.name}'? Prima verrà creato un backup dello stato attuale.", ripristina,
+                              "RIPRISTINA BACKUP", "RIPRISTINA")
+            g.add_widget(NBtn(path.name, dim=11, on_release=lambda *_, f=scegli: f()))
+        box.add_widget(sv)
+        chiudi = NBtn("ANNULLA", colore=attenua(col("accent"), .7)); box.add_widget(chiudi)
+        pop = self.popup("RIPRISTINA BACKUP", box, .9, .85)
+        chiudi.bind(on_release=lambda *_: pop.dismiss())
+
+
     # ---------- pannello admin ----------
     def v_admin(self):
         if not self._solo_admin:
@@ -1920,11 +2518,15 @@ class FantaApp(App):
                 ("ASTA MUSICISTI", lambda: self.vai(self.v_asta)),
                 ("GESTIONE MUSICISTI", lambda: self.vai(self.v_gest_musicisti)),
                 ("GESTIONE UTENTI", lambda: self.vai(self.v_gest_utenti)),
+                ("GESTIONE AZIONI", lambda: self.vai(self.v_gest_azioni)),
+                ("BONUS E MALUS", lambda: self.vai(self.v_gest_bonus)),
+                ("CARATTERISTICHE DESCRITTIVE", lambda: self.vai(self.v_gest_campi)),
                 ("ELIMINA UN EVENTO", lambda: self.vai(self.v_elimina_evento)),
                 (f"MERCATO: {'CHIUDI' if aperto else 'APRI'}", self.toggle_mercato),
                 ("IMPOSTAZIONI STAGIONE", self.f_impostazioni),
+                ("CHIUDI STAGIONE", self.f_chiudi_stagione_gui),
                 ("GIOCO ONLINE", lambda: self.vai(self.v_online)),
-                ("BACKUP E CSV", self.v_backup_popup)]
+                ("BACKUP / RIPRISTINO / CSV", self.v_backup_popup)]
         for t, f in voci:
             griglia.add_widget(NBtn(t, dim=12, height=dp(70), on_release=lambda *_, f=f: f()))
         g.add_widget(griglia)
@@ -1953,6 +2555,7 @@ class FantaApp(App):
             except OSError as e:
                 self.msg(f"Impossibile scrivere i file: {e.strerror or e}")
         box.add_widget(NBtn("CREA UN BACKUP ORA", on_release=backup))
+        box.add_widget(NBtn("RIPRISTINA UN BACKUP", on_release=lambda *_: (pop.dismiss(), self.v_ripristina_backup())))
         box.add_widget(NBtn("ESPORTA CLASSIFICHE ED EVENTI IN CSV", on_release=csv_))
         box.add_widget(NBtn("CHIUDI", colore=attenua(col("accent"), 0.7), on_release=lambda *_: pop.dismiss()))
 
@@ -2136,7 +2739,8 @@ class FantaApp(App):
                     basi.append((esito[1], "punteggio libero", False, [], None))
                 else:
                     basi.append((None, "", True, [], (esito[1], esito[2])))
-            bonus = [{"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"]}
+            bonus = [{"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"],
+                      "descrizione": b.get("descrizione", "")}
                      for cb, b in st["bonus"] if cb.active]
             nota = st["nota"].text.strip()
             gruppo = fm.prossimo_id(db, "gruppo") if len(coppie) > 1 else None

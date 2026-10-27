@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-import fantamusica as fm
+import fantamusica_core as fm
 
 ALFABETO_CODICI = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -214,10 +214,16 @@ def _evento(db, me, p):
             basi.append((None, "", [], (esito[1], esito[2])))
     validi = set(a.get("bonus_ids", []))
     bonus = []
+    visti_bonus = set()
     for i in p.get("bonus_ids") or []:
-        b = next((y for y in db["bonus"] if y["id"] == _intero(i, "bonus")), None)
+        bid = _intero(i, "bonus")
+        if bid in visti_bonus:
+            continue
+        visti_bonus.add(bid)
+        b = next((y for y in db["bonus"] if y["id"] == bid), None)
         if b and b["id"] in validi and b.get("bersaglio", "azione") == "azione":
-            bonus.append({"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"]})
+            bonus.append({"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"],
+                          "descrizione": b.get("descrizione", "")})
     nota = str(p.get("nota") or "").strip()[:200]
     gruppo = fm.prossimo_id(db, "gruppo") if len(coppie) > 1 else None
     creati = []
