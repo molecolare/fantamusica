@@ -1187,7 +1187,7 @@ class FantaApp(App):
                          and (e.get("data_completamento") or e["data"]) > da]
                 righe.append(f"Dall'ultimo accesso ({da}): {len(nuovi)} eventi per la tua squadra "
                              f"({sum(e['punti'] for e in nuovi):+d} punti).")
-        n_pend = len(fm.eventi_pending(db))
+        n_pend = len(fm.eventi_pending_visibili(db, me["ruolo"] == "admin"))
         if n_pend:
             righe.append(f"Eventi in pending (sondaggi da completare): {n_pend}.")
         nprop = sum(1 for x in db["scambi"] if x["stato"] == "proposto" and x["a"] == me["nome"])
@@ -1211,6 +1211,7 @@ class FantaApp(App):
                              row_force_default=True)
         griglia.bind(minimum_height=griglia.setter("height"))
         voci = [("CLASSIFICA", lambda: self.vai(self.v_classifica, "giocatori")),
+                ("STATISTICHE", lambda: self.vai(self.v_statistiche, "azioni")),
                 ("LA MIA SQUADRA", lambda: self.vai(self.v_squadra, me["nome"])),
                 ("REGISTRA EVENTO" if self.e_admin() else "PROPONI UN EVENTO", lambda: self.f_evento(False)),
                 ("MERCATO E SCAMBI", lambda: self.vai(self.v_mercato)),
@@ -1279,22 +1280,30 @@ class FantaApp(App):
 
     def righe_eventi(self, g, eventi):
         """Elenco di eventi: una riga ciascuno, si tocca per i dettagli e il calcolo. Quelle che
-        coinvolgono più musicisti sono gialle e dicono quanti sono."""
+        coinvolgono più musicisti sono gialle e dicono quanti sono.
+
+        Le proposte segnalate come probabili doppioni restano in elenco solo per l'admin: agli altri
+        non vengono mostrate finché sono in pending (una volta confermate tornano visibili a tutti).
+        """
         db = self.db
+        eventi = fm.nascondi_duplicati(eventi, self.e_admin())
         idx = fm.indice_gruppi(db)       # una volta sola, non per ogni riga
         if not eventi:
             g.add_widget(L("Nessun evento.", wrap=True))
         for e in eventi:
             m = next((x for x in db["musicisti"] if x["id"] == e["musicista_id"]), None)
             pts = "PENDING" if e.get("stato") == "pending" else fmt_pt(e["punti"]) + ("*" if e.get("dittatura") else "")
+            doppio = self.e_admin() and e.get("duplicato") and e.get("stato", "ok") == "pending"
             coinv = fm.descrivi_coinvolti(db, e, idx=idx)
             sotto = f"{e.get('data_completamento') or e['data']} | {e['proprietario'] or '-'}" + \
                     (f" | proposto da {e['proposto_da']}" if e.get("proposto_da") else "") + \
-                    (f" | {coinv}" if coinv else "")
+                    (f" | {coinv}" if coinv else "") + \
+                    (" | probabile doppione" if doppio else "")
             g.add_widget(self.riga(m.get("foto") if m else None, m["nome"] if m else "?",
-                                   f"{m['nome'] if m else '?'} - {e['azione']}", sotto, pts,
+                                   f"{m['nome'] if m else '?'} - {e['azione']}" + (" *" if doppio else ""),
+                                   sotto, pts,
                                    azione=lambda e=e: self.popup_evento(e),
-                                   sfondo=GIALLO if coinv else None))
+                                   sfondo=GIALLO if (coinv or doppio) else None))
 
     def popup_evento(self, e):
         """Dettagli di un evento registrato: nota, calcolo e tutti i musicisti coinvolti."""
@@ -1311,6 +1320,11 @@ class FantaApp(App):
             g.add_widget(L(f"Nota: {p['nota']}", dim=12, wrap=True))
         if p.get("proposto_da"):
             g.add_widget(L(f"Proposto da {p['proposto_da']}", dim=12, wrap=True))
+        if self.e_admin() and p.get("duplicato") and p.get("stato", "ok") == "pending":
+            g.add_widget(L("PROBABILE DOPPIONE: esiste un'altra proposta in pending con lo stesso musicista e "
+                           "la stessa azione. Questa proposta è registrata ma la vedi solo tu: confermala se è "
+                           "un evento a sé, rifiutala se è una ripetizione.",
+                           dim=11, wrap=True, colore="accent2"))
         for x in gruppo:
             m = next((y for y in db["musicisti"] if y["id"] == x["musicista_id"]), None)
             nome = m["nome"] if m else "?"
@@ -1417,6 +1431,142 @@ class FantaApp(App):
             g.add_widget(self.riga(u.get("foto") if u else None, vinc["nome"] if vinc else "?", s["nome"],
                                    f"chiusa il {s['chiusa']} - vincitore: {vinc['nome'] if vinc else '-'}",
                                    vinc["punti"] if vinc else ""))
+
+    # ---------- statistiche ----------
+    def tabella(self, g, intestazioni, righe, pesi=None):
+        """Tabellina leggibile: una riga di intestazione e una riga (Panel) per ogni voce.
+        'pesi' dà la larghezza relativa delle colonne; la prima è allineata a sinistra, le altre a destra."""
+        pesi = pesi or ([2] + [1] * (len(intestazioni) - 1))
+
+        def fila(valori, testa=False):
+            r = (BoxLayout if testa else Panel)(size_hint_y=None, height=dp(26 if testa else 32),
+                                                padding=[dp(7), dp(2)], spacing=dp(6))
+            for i, (v, w) in enumerate(zip(valori, pesi)):
+                r.add_widget(L(str(v), dim=10 if testa else 12, bold=testa, size_hint_x=w, shorten=True,
+                               colore="accent2" if testa else ("accent" if i == 0 else "testo"),
+                               halign="left" if i == 0 else "right"))
+            return r
+        g.add_widget(fila(intestazioni, True))
+        if not righe:
+            g.add_widget(L("Nessun dato ancora.", wrap=True))
+            return
+        for valori in righe:
+            g.add_widget(fila(valori))
+
+    TABS_STAT = [("azioni", "TIPI DI EVENTO"), ("musicisti", "PUNTI MUSICISTI"),
+                 ("distribuzione", "POSITIVI/NEGATIVI"), ("buff", "BUFF/DEBUFF"),
+                 ("top", "TOP 5"), ("peggio", "PEGGIO 5"), ("mercato", "MERCATO"),
+                 ("valore", "VALORE/RESA")]
+
+    def v_statistiche(self, tab="azioni"):
+        self.titolo("STATISTICHE")
+        if tab not in dict(self.TABS_STAT):
+            tab = "azioni"
+        barra = GridLayout(cols=4, size_hint_y=None, spacing=dp(5), row_default_height=dp(36),
+                           row_force_default=True)
+        barra.bind(minimum_height=barra.setter("height"))
+        for k, nome in self.TABS_STAT:
+            barra.add_widget(NBtn(nome, dim=9, height=dp(36),
+                                  colore=col("accent") if k == tab else attenua(col("accent"), 0.55),
+                                  on_release=lambda *_, k=k: self.sostituisci(self.v_statistiche, k)))
+        self.corpo.add_widget(barra)
+        self.corpo.add_widget(BoxLayout(size_hint_y=None, height=dp(6)))
+        sv, g = scroll_list(6)
+        getattr(self, "st_" + tab)(g)
+        self.corpo.add_widget(sv)
+
+    def st_azioni(self, g):
+        g.add_widget(L("Quante volte si verifica ogni tipo di evento, i punti che ha prodotto in tutto e "
+                       "la media per singolo evento.", wrap=True, dim=11, colore="accent2"))
+        self.tabella(g, ["TIPO DI EVENTO", "VOLTE", "PUNTI", "MEDIA"],
+                     [[r["nome"], r["volte"], fmt_pt(r["punti"]), f"{r['media']:+.2f}"]
+                      for r in fm.stat_per_azione(self.db)], pesi=[3, 1, 1, 1])
+
+    def st_musicisti(self, g):
+        g.add_widget(L("Punti totali generati da ciascun musicista e punti per credito d'asta "
+                       "(il rapporto compare solo per chi è stato comprato all'asta).",
+                       wrap=True, dim=11, colore="accent2"))
+        righe = []
+        for _ps, m, p in fm.classifica_musicisti(self.db):
+            prezzo = m["prezzo"] if m.get("proprietario") else 0
+            righe.append([m["nome"], fmt_pt(p), prezzo or "-", f"{p / prezzo:+.2f}" if prezzo else "-"])
+        self.tabella(g, ["MUSICISTA", "PUNTI", "PREZZO", "PT/CREDITO"], righe, pesi=[3, 1, 1, 1.2])
+
+    def st_distribuzione(self, g):
+        d = fm.stat_distribuzione(self.db)
+        n = d["eventi"]
+        quota = lambda x: f"{100 * x / n:.1f}%" if n else "-"
+        g.add_widget(L("Come si dividono gli eventi validi fra punteggi positivi, negativi e neutri.",
+                       wrap=True, dim=11, colore="accent2"))
+        self.tabella(g, ["SEGNO", "EVENTI", "QUOTA", "PUNTI"],
+                     [["Positivi", d["pos_n"], quota(d["pos_n"]), fmt_pt(d["pos_pt"])],
+                      ["Negativi", d["neg_n"], quota(d["neg_n"]), fmt_pt(d["neg_pt"])],
+                      ["Neutri (zero)", d["zero_n"], quota(d["zero_n"]), "0"],
+                      ["TOTALE", n, "100%" if n else "-", fmt_pt(d["tot_pt"])]], pesi=[2, 1, 1, 1])
+
+    def st_buff(self, g):
+        d = fm.stat_impatto_bonus(self.db)
+        g.add_widget(L("Quanto i buff/debuff hanno spostato i punteggi: si confronta il punteggio finale con "
+                       "la base, negli eventi non in dittatura che avevano almeno un bonus o malus.",
+                       wrap=True, dim=11, colore="accent2"))
+        self.tabella(g, ["VOCE", "VALORE"],
+                     [["Eventi con buff/debuff", d["eventi_con_bonus"]],
+                      ["Di cui con effetto reale", d["eventi_con_effetto"]],
+                      ["Punti aggiunti", fmt_pt(d["su"])],
+                      ["Punti sottratti", fmt_pt(d["giu"])],
+                      ["Effetto netto", fmt_pt(d["netto"])]], pesi=[3, 1])
+
+    def st_top(self, g):
+        d = fm.stat_top_musicisti(self.db, 5)
+        perc = f"{d['perc']:.1f}%" if d["perc"] is not None else "-"
+        g.add_widget(L(f"I {d['k']} musicisti migliori hanno prodotto {fmt_pt(d['somma_top'])} punti sui "
+                       f"{fmt_pt(d['totale'])} totali: il {perc} di tutto il punteggio.",
+                       wrap=True, dim=11, colore="accent2"))
+        self.tabella(g, ["MUSICISTA", "SQUADRA", "PUNTI", "QUOTA"],
+                     [[m["nome"], m.get("proprietario") or "-", fmt_pt(p),
+                       f"{100 * p / d['totale']:.1f}%" if d["totale"] else "-"] for m, p in d["top"]],
+                     pesi=[2.5, 2, 1, 1])
+
+    def st_peggio(self, g):
+        d = fm.stat_peggiori_musicisti(self.db, 5)
+        intro = (f"I 5 musicisti con meno punti hanno totalizzato {fmt_pt(d['somma_peggio'])} punti sui "
+                 f"{fmt_pt(d['totale'])} totali del campo.")
+        if d["perc"] is not None:
+            intro += f" Pesano per il {d['perc']:.1f}% dei punti negativi del campo."
+        g.add_widget(L(intro, wrap=True, dim=11, colore="accent2"))
+        self.tabella(g, ["MUSICISTA", "SQUADRA", "PUNTI"],
+                     [[m["nome"], m.get("proprietario") or "-", fmt_pt(p)] for m, p in d["peggio"]],
+                     pesi=[2.5, 2, 1])
+
+    def st_mercato(self, g):
+        g.add_widget(L("Giocatori più efficienti nel mercato: punti ottenuti per ogni credito speso in rosa.",
+                       wrap=True, dim=11, colore="accent2"))
+        self.tabella(g, ["GIOCATORE", "SPESO", "PUNTI", "PT/CREDITO"],
+                     [[r["nome"], r["speso"], fmt_pt(r["punti"]), f"{r['resa']:+.2f}"]
+                      for r in fm.stat_efficienza_mercato(self.db)], pesi=[2.5, 1, 1, 1.2])
+
+    def st_valore(self, g):
+        resa, righe = fm.stat_valore_rendimento(self.db)
+        g.add_widget(L(f"Valore d'asta contro rendimento reale. La resa media è {resa:+.2f} punti per credito: "
+                       f"«atteso» è quanto avrebbe dovuto rendere un musicista pagato quel prezzo, «scarto» "
+                       f"quanto ha reso in più (o in meno).", wrap=True, dim=11, colore="accent2"))
+        self.tabella(g, ["MUSICISTA", "PREZZO", "PUNTI", "ATTESO", "SCARTO"],
+                     [[r["musicista"]["nome"], r["prezzo"], fmt_pt(r["punti"]), r["atteso"],
+                       fmt_pt(r["delta"])] for r in righe], pesi=[2.5, 1, 1, 1, 1])
+
+    # ---------- verifica integrità dei dati (solo lettura) ----------
+    def f_verifica_integrita(self):
+        if not self._solo_admin:
+            return
+        problemi = fm.valida_integrita(self.db)
+        if not problemi:
+            self.msg("Nessun problema: riferimenti, ID, proprietari, bonus, azioni, scambi, contatori, crediti "
+                     "e rose risultano coerenti.\n\nIl controllo è di sola lettura: non ha modificato nulla.",
+                     "VERIFICA INTEGRITÀ")
+            return
+        self.msg(f"Trovati {len(problemi)} problemi. Il controllo è di sola lettura: non ha modificato nulla, "
+                 f"decidi tu cosa correggere.\n\n" + "\n".join("- " + p for p in problemi),
+                 "VERIFICA INTEGRITÀ")
 
     # ---------- profili ----------
     def v_squadra(self, nome):
@@ -2543,6 +2693,8 @@ class FantaApp(App):
                 ("BONUS E MALUS", lambda: self.vai(self.v_gest_bonus)),
                 ("CARATTERISTICHE DESCRITTIVE", lambda: self.vai(self.v_gest_campi)),
                 ("ELIMINA UN EVENTO", lambda: self.vai(self.v_elimina_evento)),
+                ("VERIFICA INTEGRITÀ DEI DATI", self.f_verifica_integrita),
+                ("STATISTICHE", lambda: self.vai(self.v_statistiche, "azioni")),
                 (f"MERCATO: {'CHIUDI' if aperto else 'APRI'}", self.toggle_mercato),
                 ("IMPOSTAZIONI STAGIONE", self.f_impostazioni),
                 ("CHIUDI STAGIONE", self.f_chiudi_stagione_gui),
@@ -2771,6 +2923,10 @@ class FantaApp(App):
                       "descrizione": b.get("descrizione", "")}
                      for cb, b in st["bonus"] if cb.active]
             nota = st["nota"].text.strip()
+            # Probabile doppione: solo per le proposte dei giocatori. Se un'altra proposta in pending ha già
+            # lo stesso musicista e la stessa azione, l'evento viene comunque registrato ma segnalato e
+            # mostrato soltanto nella lista pending dell'admin. L'admin, invece, registra sempre senza blocchi.
+            doppione = proposta and any(fm.evento_duplicato_pending(db, a["id"], m["id"]) for m, _s in coppie)
             gruppo = fm.prossimo_id(db, "gruppo") if len(coppie) > 1 else None
             esiti = []
             for (m, s), (base, dett, pending, voti, fascia) in zip(coppie, basi):
@@ -2784,6 +2940,7 @@ class FantaApp(App):
                                                voti=voti, gruppo=gruppo, ruolo=ruolo)
                     e["da_approvare"], e["proposto_da"] = True, me["nome"]
                     e["proposta_base"] = None if fascia else base
+                    e["duplicato"] = doppione
                     if fascia:
                         e["aventi_diritto_voto"] = [u["nome"] for u in fm.giocatori(db)]
                         e["votanti"] = [me["nome"]] if voti and me["nome"] in e["aventi_diritto_voto"] else []
@@ -2802,9 +2959,14 @@ class FantaApp(App):
                     esiti.append(f"{m['nome']}: " + ("PENDING" if pending else f"{punti:+d}"))
             self.salva()
             pop.dismiss()
-            self.msg(("Proposta inviata. I sondaggi sono segreti e si chiudono da soli quando hanno votato "
-                      "tutti; le proposte con punteggio fisso restano da confermare dall'admin.\n" if proposta
-                      else "Registrato:\n") + "\n".join(esiti))
+            if doppione:
+                self.msg("Esiste già una proposta in pending con lo stesso musicista e la stessa azione: "
+                         "l'evento è stato comunque registrato, ma non viene mostrato per evitare doppioni. "
+                         "Rivolgiti all'admin se pensi che sia corretto.")
+            else:
+                self.msg(("Proposta inviata. I sondaggi sono segreti e si chiudono da soli quando hanno votato "
+                          "tutti; le proposte con punteggio fisso restano da confermare dall'admin.\n" if proposta
+                          else "Registrato:\n") + "\n".join(esiti))
             self.render()
         si.bind(on_release=invia)
 
@@ -2812,11 +2974,17 @@ class FantaApp(App):
     def v_pending(self):
         self.titolo("EVENTI IN PENDING")
         sv, g = scroll_list()
-        pend = fm.eventi_pending(self.db)
+        pend = fm.eventi_pending_visibili(self.db, self.e_admin())
         if not pend:
             g.add_widget(L("Nessun evento in pending.", wrap=True))
+        if self.e_admin() and any(e.get("duplicato") for e in pend):
+            g.add_widget(L("Le righe gialle con * sono probabili doppioni: un altro giocatore aveva già proposto "
+                           "lo stesso musicista con la stessa azione. Sono registrate ma le vedi solo tu; chi le "
+                           "ha proposte è stato avvisato di rivolgersi a te.",
+                           wrap=True, dim=11, colore="accent2"))
         for e in pend:
             m = next((x for x in self.db["musicisti"] if x["id"] == e["musicista_id"]), None)
+            doppio = bool(e.get("duplicato"))
             if e.get("proposta_base") is not None:
                 sotto = f"{e['data']} | proposto da {e.get('proposto_da', '?')}"
                 stato = "DA CONFERMARE"
@@ -2827,9 +2995,12 @@ class FantaApp(App):
             else:
                 sotto = f"{e['data']} | pending"
                 stato = "PENDING"
+            if doppio:
+                stato = "DOPPIONE?"
             g.add_widget(self.riga(m.get("foto") if m else None, m["nome"] if m else "?",
-                                   f"#{e['id']} {m['nome'] if m else '?'} - {e['azione']}",
-                                   sotto, stato, lambda e=e: self.f_pending(e)))
+                                   f"#{e['id']} {m['nome'] if m else '?'} - {e['azione']}" + (" *" if doppio else ""),
+                                   sotto, stato, lambda e=e: self.f_pending(e),
+                                   sfondo=GIALLO if doppio else None))
         self.corpo.add_widget(sv)
 
     def f_pending(self, e):
@@ -2839,6 +3010,11 @@ class FantaApp(App):
         info = e["azione"]
         if e.get("da_approvare"):
             info = f"Proposto da {e.get('proposto_da', '?')}: " + info
+        if e.get("duplicato"):
+            info += ("\nPROBABILE DOPPIONE: quando è stata inviata, c'era già un'altra proposta in pending con "
+                     "lo stesso musicista e la stessa azione. È registrata ma la vedi solo tu, e chi l'ha "
+                     "proposta è stato avvisato di rivolgersi a te. Se è un evento a sé confermala "
+                     "(torna visibile a tutti), se è una ripetizione rifiutala.")
         if ha_proposta:
             info += (f"\nPunteggio proposto: {fm.calcola_punti(e['proposta_base'], e['bonus']):+d} "
                      f"(base {e['proposta_base']})" + (f" - {e['dettaglio']}" if e.get("dettaglio") else ""))
@@ -2874,6 +3050,8 @@ class FantaApp(App):
                         ) if mx else (punti, [])
                     x["punti"] = punti
                     x["stato"], x["da_approvare"], x["data_completamento"] = "ok", False, adesso
+                    # confermando, la proposta diventa un evento normale: non è più un doppione nascosto
+                    x["duplicato"] = False
             self.finito(pop)
 
         def rifiuta():

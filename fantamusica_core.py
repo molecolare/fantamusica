@@ -264,6 +264,7 @@ def migra(db):
         imposta(e, "gruppo", None)
         imposta(e, "ruolo", "")
         imposta(e, "bonus_auto", [])
+        imposta(e, "duplicato", False)   # proposta segnalata come probabile doppione (vista solo dall'admin)
         for b in e["bonus"]:
             if "formula" in b or b.get("tipo") not in ("punti", "percentuale"):
                 f = b.pop("formula", None) or b.get("tipo")
@@ -482,6 +483,43 @@ def eventi_pending(db):
     return [e for e in db["eventi"] if e.get("stato", "ok") == "pending"]
 
 
+def evento_duplicato_pending(db, azione_id, musicista_id, escludi_gruppo=None):
+    """True se esiste già un evento in PENDING con lo stesso musicista e la stessa azione.
+
+    Serve a segnalare le proposte doppione dei giocatori (es. due persone registrano lo stesso
+    singolo). ``escludi_gruppo`` evita che le righe della stessa proposta multi-musicista si
+    segnalino fra loro. Non considera gli eventi già confermati: un doppione rispetto a un evento
+    chiuso è una decisione che spetta all'admin, non un blocco automatico.
+    """
+    for e in db["eventi"]:
+        if e.get("stato", "ok") != "pending":
+            continue
+        if escludi_gruppo is not None and e.get("gruppo") == escludi_gruppo:
+            continue
+        if e.get("azione_id") == azione_id and e["musicista_id"] == musicista_id:
+            return True
+    return False
+
+
+def eventi_pending_visibili(db, admin):
+    """Gli eventi in pending da mostrare: all'admin tutti, agli altri senza le proposte doppione.
+
+    Le proposte segnalate come probabili doppioni restano registrate ma compaiono solo nella lista
+    pending dell'admin, così i giocatori non vedono (né votano) copie dello stesso evento.
+    """
+    return [e for e in eventi_pending(db) if admin or not e.get("duplicato")]
+
+
+def nascondi_duplicati(eventi, admin):
+    """Toglie da un elenco di eventi le proposte doppione ancora in pending (visibili solo all'admin).
+
+    Il flag vale finché la proposta è in pending: se l'admin la conferma diventa un evento normale e
+    torna visibile a tutti, qualunque sia il flag rimasto nei dati.
+    """
+    return eventi if admin else [e for e in eventi
+                                 if not (e.get("duplicato") and e.get("stato", "ok") == "pending")]
+
+
 def eventi_auto_chiusi(db):
     """Sondaggi che erano in pending e sono stati chiusi automaticamente quando hanno votato
     tutti i giocatori aventi diritto. Il flag resta nello storico per permettere all'admin di filtrarli."""
@@ -656,7 +694,6 @@ def parse_range(testo):
         return None
     lo, hi = int(parti[0]), int(parti[1])
     return (lo, hi) if lo < hi else None
-
 
 
 
@@ -955,6 +992,239 @@ def classifica_cumulativa(db, includi_corrente=True):
     return [(p, n, d) for p, (n, d) in zip(pos, righe)]
 
 
+# --------------------------------------------------------------------------
+# Statistiche avanzate (funzioni pure: le usa la CLI, le richiama Kivy, la pagina web le rifà in JS)
+# --------------------------------------------------------------------------
+def stat_per_azione(db):
+    """[{nome, volte, punti, media}] per ogni tipo di evento, dal più frequente.
+    Copre: quante volte si verifica ogni tipo di evento e i punti medi per tipo."""
+    agg = {}
+    for e in eventi_ok(db):
+        c = agg.setdefault(e["azione"], [0, 0])
+        c[0] += 1
+        c[1] += e["punti"]
+    righe = [{"nome": n, "volte": v, "punti": p, "media": p / v} for n, (v, p) in agg.items()]
+    righe.sort(key=lambda r: (-r["volte"], r["nome"].lower()))
+    return righe
+
+
+def stat_distribuzione(db):
+    """Distribuzione positivo/negativo degli eventi validi: conteggi e punti per segno."""
+    ev = eventi_ok(db)
+    pos = [e for e in ev if e["punti"] > 0]
+    neg = [e for e in ev if e["punti"] < 0]
+    zero = [e for e in ev if e["punti"] == 0]
+    return {
+        "eventi": len(ev),
+        "pos_n": len(pos), "neg_n": len(neg), "zero_n": len(zero),
+        "pos_pt": sum(e["punti"] for e in pos),
+        "neg_pt": sum(e["punti"] for e in neg),
+        "tot_pt": sum(e["punti"] for e in ev),
+    }
+
+
+def stat_impatto_bonus(db):
+    """Impatto dei buff/debuff: quanto i bonus/malus (classici + automatici) hanno spostato i punteggi.
+
+    Per ogni evento valido non in DITTATURA con una base nota, l'effetto è punti_finali - base.
+    Ritorna i conteggi e la somma degli scostamenti positivi/negativi/netti.
+    """
+    n_eventi = n_con_effetto = 0
+    su = giu = 0
+    for e in eventi_ok(db):
+        if e.get("dittatura") or e.get("base") is None:
+            continue
+        if not e.get("bonus") and not e.get("bonus_auto"):
+            continue
+        n_eventi += 1
+        delta = e["punti"] - e["base"]
+        if delta > 0:
+            su += delta
+        elif delta < 0:
+            giu += delta
+        if delta:
+            n_con_effetto += 1
+    return {"eventi_con_bonus": n_eventi, "eventi_con_effetto": n_con_effetto,
+            "su": su, "giu": giu, "netto": su + giu}
+
+
+def stat_top_musicisti(db, k=5):
+    """Percentuale dei punti totali prodotta dai k musicisti migliori.
+    Ritorna {top: [(musicista, punti)], somma_top, totale, perc (0-100 o None)}."""
+    mus = totali_punti(db)[0]
+    righe = sorted(((m, mus.get(m["id"], 0)) for m in db["musicisti"]), key=lambda x: -x[1])
+    top = righe[:k]
+    somma_top = sum(p for _, p in top)
+    totale = sum(p for _, p in righe)
+    perc = (100 * somma_top / totale) if totale else None
+    return {"top": top, "somma_top": somma_top, "totale": totale, "perc": perc, "k": k}
+
+
+def stat_peggiori_musicisti(db, k=5):
+    """I k musicisti con meno punti (simmetrica a stat_top_musicisti, stessa forma di ritorno).
+    'perc' qui è la quota di punti NEGATIVI attribuibile ai k peggiori, quando il totale è negativo;
+    se il totale dei peggiori è positivo o il totale generale è zero, 'perc' è None (il confronto in
+    percentuale perderebbe senso)."""
+    mus = totali_punti(db)[0]
+    righe = sorted(((m, mus.get(m["id"], 0)) for m in db["musicisti"]), key=lambda x: x[1])
+    peggio = righe[:k]
+    somma_peggio = sum(p for _, p in peggio)
+    totale = sum(p for _, p in righe)
+    perc = (100 * somma_peggio / totale) if totale and somma_peggio < 0 and totale < 0 else None
+    return {"peggio": peggio, "somma_peggio": somma_peggio, "totale": totale, "perc": perc, "k": k}
+
+
+def stat_efficienza_mercato(db):
+    """Giocatori più efficienti nel mercato: punti per credito effettivamente speso in rosa.
+    [{nome, speso, punti, resa}] solo per chi ha speso qualcosa, dal più efficiente."""
+    _, uten, _ = totali_punti(db)
+    righe = []
+    for u in giocatori(db):
+        sp = speso(db, u["nome"])
+        if sp > 0:
+            righe.append({"nome": u["nome"], "speso": sp, "punti": uten.get(u["nome"], 0),
+                          "resa": uten.get(u["nome"], 0) / sp})
+    righe.sort(key=lambda r: (-r["resa"], r["nome"].lower()))
+    return righe
+
+
+def stat_valore_rendimento(db):
+    """Confronto tra valore d'asta e rendimento reale dei musicisti acquistati.
+
+    Calcola la resa media del campo (punti totali / crediti totali spesi) e, per ogni musicista
+    comprato, il rendimento atteso a quel prezzo (prezzo x resa media) e lo scarto col reale.
+    Ritorna (resa_media, [{musicista, prezzo, punti, atteso, delta}]) ordinato dal più
+    sopra le attese al più sotto.
+    """
+    coppie = totali_punti(db)[2]
+    comprati = [(m, coppie.get((m["id"], m["proprietario"]), 0))
+                for m in db["musicisti"] if m["proprietario"] and m["prezzo"] > 0]
+    speso_tot = sum(m["prezzo"] for m, _ in comprati)
+    punti_tot = sum(p for _, p in comprati)
+    resa_media = (punti_tot / speso_tot) if speso_tot else 0
+    righe = []
+    for m, p in comprati:
+        atteso = arrotonda(m["prezzo"] * resa_media)
+        righe.append({"musicista": m, "prezzo": m["prezzo"], "punti": p,
+                      "atteso": atteso, "delta": p - atteso})
+    righe.sort(key=lambda r: -r["delta"])
+    return resa_media, righe
+
+
+# --------------------------------------------------------------------------
+# Validazione dell'integrità dei dati (sola lettura: non modifica nulla)
+# --------------------------------------------------------------------------
+def valida_integrita(db):
+    """Controlla riferimenti, ID, proprietari, bonus, azioni, scambi, contatori, crediti e rose.
+
+    Non modifica nulla: ritorna un elenco di problemi, ciascuno come una riga già leggibile
+    (es. 'Evento 147 → bonus_id 12 inesistente'). Elenco vuoto = nessun problema trovato.
+    """
+    problemi = []
+    P = problemi.append
+    ids_mus = {m["id"] for m in db["musicisti"]}
+    ids_az = {a["id"] for a in db["azioni"]}
+    ids_bonus = {b["id"] for b in db["bonus"]}
+    nomi_utenti = {u["nome"] for u in db["utenti"]}
+    nomi_giocatori = {u["nome"] for u in giocatori(db)}
+    n_max = db["impostazioni"].get("musicisti_per_squadra")
+
+    # Musicisti: ID unici, proprietario coerente, prezzo coerente con lo stato
+    visti = set()
+    for m in db["musicisti"]:
+        mid = m.get("id")
+        if mid in visti:
+            P(f"Musicista {mid} → ID duplicato")
+        visti.add(mid)
+        prop = m.get("proprietario")
+        if prop:
+            if prop not in nomi_utenti:
+                P(f"Musicista {mid} → proprietario \"{prop}\" non presente tra gli utenti")
+            elif prop not in nomi_giocatori:
+                P(f"Musicista {mid} → proprietario \"{prop}\" non presente tra i partecipanti")
+            if m.get("prezzo", 0) < 1:
+                P(f"Musicista {mid} → assegnato a \"{prop}\" ma prezzo {m.get('prezzo')} (atteso ≥ 1)")
+        elif m.get("prezzo"):
+            P(f"Musicista {mid} → libero ma con prezzo {m.get('prezzo')} (atteso 0)")
+
+    # Azioni: bonus collegati esistenti, modalità valida
+    for a in db["azioni"]:
+        for i in a.get("bonus_ids", []):
+            if i not in ids_bonus:
+                P(f"Azione {a['id']} → bonus_id {i} inesistente")
+        if a.get("modalita") not in ("fisso", "sondaggio", "tempo"):
+            P(f"Azione {a['id']} → modalità \"{a.get('modalita')}\" non valida")
+
+    # Bonus: bersaglio coerente, tipo valido
+    for b in db["bonus"]:
+        bers = b.get("bersaglio", "azione")
+        if bers == "musicista" and b.get("musicista_id") not in ids_mus:
+            P(f"Bonus {b['id']} → musicista_id {b.get('musicista_id')} inesistente")
+        elif bers == "giocatore" and b.get("giocatore") not in nomi_utenti:
+            P(f"Bonus {b['id']} → giocatore \"{b.get('giocatore')}\" inesistente")
+        if b.get("tipo") not in ("punti", "percentuale"):
+            P(f"Bonus {b['id']} → tipo \"{b.get('tipo')}\" non valido")
+
+    # Eventi: musicista/azione/proprietario esistenti, stato valido, gruppo coerente
+    for e in db["eventi"]:
+        eid = e.get("id")
+        if e.get("musicista_id") not in ids_mus:
+            P(f"Evento {eid} → musicista_id {e.get('musicista_id')} inesistente")
+        aid = e.get("azione_id")
+        if aid is not None and aid not in ids_az:
+            P(f"Evento {eid} → azione_id {aid} inesistente")
+        prop = e.get("proprietario")
+        if prop and prop not in nomi_utenti:
+            P(f"Evento {eid} → proprietario \"{prop}\" non presente tra gli utenti")
+        if e.get("stato", "ok") not in ("ok", "pending"):
+            P(f"Evento {eid} → stato \"{e.get('stato')}\" non valido")
+
+    # Scambi: utenti e musicisti esistenti
+    for x in db["scambi"]:
+        sid = x.get("id")
+        for campo in ("da", "a"):
+            if x.get(campo) not in nomi_utenti:
+                P(f"Scambio {sid} → {campo} \"{x.get(campo)}\" inesistente")
+        for i in list(x.get("offro", [])) + list(x.get("chiedo", [])):
+            if i not in ids_mus:
+                P(f"Scambio {sid} → musicista {i} inesistente")
+
+    # Contatori: devono superare ogni ID già usato (ID mai riciclati)
+    massimi = {"musicista": ("musicisti", "id"), "azione": ("azioni", "id"), "bonus": ("bonus", "id"),
+               "scambio": ("scambi", "id"), "campo": ("campi", "id"), "stagione": ("storico", "id"),
+               "evento": ("eventi", "id"), "gruppo": ("eventi", "gruppo")}
+    for cont, (lista, campo) in massimi.items():
+        usati = [x.get(campo) for x in db.get(lista, []) if isinstance(x.get(campo), int)]
+        cur = db.get("contatori", {}).get(cont)
+        if not isinstance(cur, int):
+            P(f"Contatore {cont} → valore \"{cur}\" non valido")
+        elif usati and cur <= max(usati):
+            # senza nessun ID in uso non c'è niente da superare: il contatore va bene qualunque sia
+            P(f"Contatore {cont} → è {cur} ma esiste già un ID {max(usati)} (dovrebbe superarlo)")
+
+    # Crediti e rose
+    for u in giocatori(db):
+        cr = crediti(db, u["nome"])
+        if cr < 0:
+            P(f"Giocatore \"{u['nome']}\" → crediti negativi ({cr})")
+        n = len(rosa(db, u["nome"]))
+        if n_max is not None and n > n_max:
+            P(f"Giocatore \"{u['nome']}\" → {n} musicisti in rosa (massimo {n_max})")
+
+    # Utenti: almeno un admin, codici d'asta unici
+    if not any(u["ruolo"] == "admin" for u in db["utenti"]):
+        P("Utenti → nessun admin presente")
+    codici = {}
+    for u in db["utenti"]:
+        c = u.get("codice_asta")
+        if c:
+            if c in codici:
+                P(f"Utenti → codice d'asta duplicato tra \"{codici[c]}\" e \"{u['nome']}\"")
+            codici[c] = u["nome"]
+
+    return problemi
+
+
 # ----- recupero password -----
 # ----- backup ed esportazione -----
 CHIAVI_OBBLIGATORIE = ("impostazioni", "utenti", "musicisti", "azioni", "eventi", "contatori")
@@ -1245,7 +1515,7 @@ class Gioco:
                              and (e.get("data_completamento") or e["data"]) > da]
                     righe.append(f"Dall'ultimo accesso ({da}): {len(nuovi)} eventi per la tua squadra "
                                  f"({sum(e['punti'] for e in nuovi):+d} punti).")
-            n_pend = len(eventi_pending(db))
+            n_pend = len(eventi_pending_visibili(db, me["ruolo"] == "admin"))
             if n_pend:
                 righe.append(f"Eventi in pending (sondaggi da completare): {n_pend}.")
             nprop = sum(1 for x in db["scambi"] if x["stato"] == "proposto" and x["a"] == me["nome"])
@@ -1411,7 +1681,8 @@ class Gioco:
         return [Col("id", "ID", lambda e: e["id"], ">"),
                 Col("data", "Data", lambda e: e.get("data_completamento") or e["data"]),
                 Col("musicista", "Musicista", lambda e: nome_musicista(db, e["musicista_id"]), fmt=musicista_txt),
-                Col("azione", "Azione", lambda e: e["azione"]),
+                Col("azione", "Azione", lambda e: e["azione"],
+                    fmt=lambda v, e: v + (" *" if e.get("duplicato") else "")),
                 Col("punti", "Punti", lambda e: e["punti"], ">", fmt=punti_txt,
                     ordine=lambda e: e["punti"] if e.get("stato") != "pending" else None),
                 Col("squadra", "Squadra", lambda e: e["proprietario"]),
@@ -1536,10 +1807,15 @@ class Gioco:
     def menu_statistiche(self):
         self.menu("Statistiche", [
             ("Riepilogo generale", self.stat_riepilogo),
-            ("Azioni più frequenti", self.stat_azioni),
+            ("Azioni più frequenti (volte e punti medi)", self.stat_azioni),
             ("Squadre a confronto", self.stat_squadre),
             ("Dettaglio di una squadra", self.scegli_squadra),
             ("Migliori e peggiori affari (punti per credito)", self.stat_affari),
+            ("Impatto dei buff/debuff", self.stat_bonus_impatto),
+            ("Top 5 musicisti e distribuzione punti", self.stat_top),
+            ("Peggiori 5 musicisti", self.stat_peggio),
+            ("Efficienza nel mercato (punti per credito speso)", self.stat_mercato),
+            ("Valore d'asta vs rendimento reale", self.stat_valore_rendimento_vista),
             ("Ultimi eventi", self.stat_ultimi_eventi),
             ("Dettagli di un evento (con i musicisti coinvolti)", self.stat_dettaglio_evento),
             ("Eventi in pending", self.stat_pending),
@@ -1560,7 +1836,7 @@ class Gioco:
         print(f"  Giocatori:              {len(gio)}")
         print(f"  Musicisti acquistati:   {len(venduti)}/{len(mus)} ({pct(len(venduti), len(mus))})")
         print(f"  Crediti spesi in asta:  {speso_tot}/{budget_tot} ({pct(speso_tot, budget_tot)})")
-        print(f"  Eventi registrati:      {len(ev)}  (in pending: {len(eventi_pending(db))})")
+        print(f"  Eventi registrati:      {len(ev)}  (in pending: {len(eventi_pending_visibili(db, self.me['ruolo'] == 'admin'))})")
         if ev:
             print(f"    positivi:             {len(pos)} ({pct(len(pos), len(ev))})")
             print(f"    negativi:             {len(neg)} ({pct(len(neg), len(ev))})")
@@ -1670,12 +1946,81 @@ class Gioco:
         self.vista("st_affari", cols, righe, ("resa", True),
                    "\nResa dei musicisti (punti per credito speso)")
 
+    def stat_bonus_impatto(self):
+        d = stat_impatto_bonus(self.db)
+        print("\nImpatto dei buff/debuff (bonus/malus classici + automatici)")
+        if not d["eventi_con_bonus"]:
+            print("  Nessun evento con bonus/malus applicati.")
+            return
+        print(f"  Eventi con bonus/malus:   {d['eventi_con_bonus']}")
+        print(f"  Di cui con effetto ≠ 0:   {d['eventi_con_effetto']}")
+        print(f"  Punti aggiunti (buff):    {d['su']:+d}")
+        print(f"  Punti tolti (debuff):     {d['giu']:+d}")
+        print(f"  Effetto netto sui punti:  {d['netto']:+d}")
+
+    def stat_top(self):
+        d = stat_top_musicisti(self.db, 5)
+        if d["perc"] is None:
+            print("\nNessun punto assegnato ai musicisti: statistica non disponibile.")
+            return
+        print(f"\nI 5 musicisti migliori producono {d['somma_top']} punti su {d['totale']} "
+              f"({d['perc']:.1f}% del totale).")
+        righe = [(i + 1, m["nome"], p) for i, (m, p) in enumerate(d["top"])]
+        cols = [Col("pos", "Pos", lambda r: r[0], ">"),
+                Col("nome", "Musicista", lambda r: r[1]),
+                Col("punti", "Punti", lambda r: r[2], ">"),
+                Col("perc", "% sul totale", lambda r: r[2], ">",
+                    fmt=lambda v, r: pct(v, d["totale"]), ordinabile=False)]
+        self.stampa("st_top", cols, righe, ("punti", True))
+
+    def stat_peggio(self):
+        d = stat_peggiori_musicisti(self.db, 5)
+        if not d["peggio"]:
+            print("\nNessun musicista: statistica non disponibile.")
+            return
+        intro = f"\nI 5 musicisti con meno punti: {d['somma_peggio']:+d} punti su {d['totale']:+d} totali."
+        if d["perc"] is not None:
+            intro += f" ({d['perc']:.1f}% dei punti negativi del campo.)"
+        print(intro)
+        righe = [(i + 1, m["nome"], p) for i, (m, p) in enumerate(d["peggio"])]
+        cols = [Col("pos", "Pos", lambda r: r[0], ">"),
+                Col("nome", "Musicista", lambda r: r[1]),
+                Col("punti", "Punti", lambda r: r[2], ">")]
+        self.stampa("st_peggio", cols, righe, ("punti", False))
+
+    def stat_mercato(self):
+        righe = stat_efficienza_mercato(self.db)
+        if not righe:
+            print("Nessun giocatore ha ancora speso crediti.")
+            return
+        cols = [Col("nome", "Giocatore", lambda r: r["nome"]),
+                Col("speso", "Speso", lambda r: r["speso"], ">"),
+                Col("punti", "Punti", lambda r: r["punti"], ">"),
+                Col("resa", "Punti/credito", lambda r: r["resa"], ">", fmt=lambda v, r: f"{v:.2f}")]
+        self.vista("st_mercato", cols, righe, ("resa", True),
+                   "\nEfficienza nel mercato: punti ottenuti per ogni credito speso in rosa")
+
+    def stat_valore_rendimento_vista(self):
+        resa_media, righe = stat_valore_rendimento(self.db)
+        if not righe:
+            print("Nessun musicista acquistato.")
+            return
+        cols = [Col("nome", "Musicista", lambda r: r["musicista"]["nome"]),
+                Col("squadra", "Squadra", lambda r: r["musicista"]["proprietario"]),
+                Col("prezzo", "Prezzo", lambda r: r["prezzo"], ">"),
+                Col("punti", "Punti reali", lambda r: r["punti"], ">"),
+                Col("atteso", "Punti attesi", lambda r: r["atteso"], ">"),
+                Col("delta", "Scarto", lambda r: r["delta"], ">", fmt=lambda v, r: f"{v:+d}")]
+        self.vista("st_valrend", cols, righe, ("delta", True),
+                   f"\nValore d'asta vs rendimento reale (resa media del campo: {resa_media:.2f} punti/credito)."
+                   "\n'Punti attesi' = prezzo x resa media; scarto positivo = ha reso più di quanto è costato.")
+
     def stat_ultimi_eventi(self):
         if not self.db["eventi"]:
             print("Nessun evento registrato.")
             return
         periodo = prefs(self.me)["periodo_eventi"]
-        eventi = eventi_periodo(self.db, periodo)
+        eventi = nascondi_duplicati(eventi_periodo(self.db, periodo), self.me["ruolo"] == "admin")
         self.vista("eventi", self.colonne_eventi(), eventi, ("data", True),
                    f"\nEventi: {etichetta_periodo(periodo)} ({len(eventi)})"
                    " - il periodo si cambia da Impostazioni > Preferenze"
@@ -1687,9 +2032,12 @@ class Gioco:
         if not db["eventi"]:
             print("Nessun evento registrato.")
             return
-        e = self.scegli_per_id(db["eventi"], "ID evento (anche di un musicista coinvolto; invio per "
-                                             "annullare): ",
-                               lambda: self.mostra_eventi(eventi_periodo(db, prefs(self.me)["periodo_eventi"])))
+        admin = self.me["ruolo"] == "admin"
+        selezionabili = nascondi_duplicati(db["eventi"], admin)
+        e = self.scegli_per_id(selezionabili, "ID evento (anche di un musicista coinvolto; invio per "
+                                              "annullare): ",
+                               lambda: self.mostra_eventi(nascondi_duplicati(
+                                   eventi_periodo(db, prefs(self.me)["periodo_eventi"]), admin)))
         if e:
             self.mostra_dettaglio_evento(e)
 
@@ -1716,12 +2064,15 @@ class Gioco:
         print(f"\nTotale evento: {tot:+d} punti")
 
     def stat_pending(self):
-        pend = eventi_pending(self.db)
+        admin = self.me["ruolo"] == "admin"
+        pend = eventi_pending_visibili(self.db, admin)
         if not pend:
             print("Nessun evento in pending.")
             return
-        self.vista("pending", self.colonne_eventi(), pend, ("data", True),
-                   "\nEventi in pending: il punteggio si decide dopo il sondaggio")
+        intest = "\nEventi in pending: il punteggio si decide dopo il sondaggio"
+        if admin and any(e.get("duplicato") for e in pend):
+            intest += "\n(* = proposta segnalata come probabile doppione, visibile solo a te)"
+        self.vista("pending", self.colonne_eventi(), pend, ("data", True), intest)
 
     # ---------- profili (consultazione, per tutti) ----------
     # ---------- impostazioni ----------
@@ -1917,6 +2268,7 @@ class Gioco:
             ("Gestione utenti", self.menu_utenti),
             ("Caratteristiche descrittive", self.menu_campi),
             ("Elimina un evento", self.elimina_evento),
+            ("Verifica integrità dei dati", self.verifica_integrita),
             ("Backup ed esportazione", self.menu_backup),
             ("Chiudi la stagione (archivia e azzera)", self.chiudi_stagione),
         ])
@@ -2247,6 +2599,18 @@ class Gioco:
                 riempi_buco(db, "eventi", "evento", x["id"])
             print("Evento eliminato: i punti sono stati tolti alla squadra." if len(da_togliere) == 1
                   else f"{len(da_togliere)} eventi eliminati.")
+
+    @solo_admin
+    def verifica_integrita(self):
+        """Controllo di sola lettura: non modifica nulla, elenca gli eventuali problemi trovati."""
+        problemi = valida_integrita(self.db)
+        if not problemi:
+            print("\nIntegrità dei dati: nessun problema trovato. ✔")
+            return
+        print(f"\nIntegrità dei dati: trovati {len(problemi)} problemi (nessun dato è stato modificato):")
+        for p in problemi:
+            print(f"  - {p}")
+        print("\nRisolvili dalle sezioni del pannello admin (o da un backup); poi riesegui la verifica.")
 
     # ----- asta -----
     def stato_crediti(self):

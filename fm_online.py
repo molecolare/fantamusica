@@ -225,6 +225,9 @@ def _evento(db, me, p):
             bonus.append({"nome": b["nome"], "tipo": b["tipo"], "valore": b["valore"],
                           "descrizione": b.get("descrizione", "")})
     nota = str(p.get("nota") or "").strip()[:200]
+    # Probabile doppione: un'altra proposta già in pending ha lo stesso musicista e la stessa azione.
+    # In tal caso l'evento viene comunque registrato, ma segnalato (duplicato) e mostrato solo all'admin.
+    doppione = any(fm.evento_duplicato_pending(db, a["id"], mm["id"]) for mm, _ in coppie)
     gruppo = fm.prossimo_id(db, "gruppo") if len(coppie) > 1 else None
     creati = []
     for (m, s), (base, dett, voti, fascia) in zip(coppie, basi):
@@ -232,10 +235,16 @@ def _evento(db, me, p):
                               gruppo=gruppo, ruolo=g.ruolo_evento(a, s))
         e["da_approvare"], e["proposto_da"] = True, me["nome"]
         e["proposta_base"] = None if (s and a["modalita"] == "sondaggio") else base
+        e["duplicato"] = doppione
         if voti:
             e["votanti"] = [me["nome"]]
         creati.append(e)
-    return f"Proposta inviata ({len(creati)} event{'o' if len(creati) == 1 else 'i'}): l'admin la confermerà."
+    n = len(creati)
+    if doppione:
+        return (f"Esiste già una proposta in pending con lo stesso musicista e la stessa azione: "
+                f"l'evento è stato comunque registrato, ma non viene mostrato per evitare doppioni. "
+                f"Rivolgiti all'admin se pensi che sia corretto.")
+    return f"Proposta inviata ({n} event{'o' if n == 1 else 'i'}): l'admin la confermerà."
 
 
 def _scambio_proponi(db, me, p):

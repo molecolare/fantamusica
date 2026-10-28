@@ -2,6 +2,8 @@
 fantamusica_dati.json
 fantamusica_online.json
 fantamusica_dati.tmp
+fantamusica_online_base.json
+supabase_fantabanda.sql
 *.bak
 *.html
 *.txt
