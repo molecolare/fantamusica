@@ -3,9 +3,8 @@
 """
 FANTAMUSICA - applicazione principale (Kivy) con stile retro-neon.
 
-La logica condivisa vive in fantamusica_core.py: non dipende più da fantamusica.py.
-Per giocare si avvia solo questa app; la modalità testuale è disponibile anche dentro Kivy
-con il pulsante MODALITÀ TERMINALE e usa gli stessi dati.
+La logica condivisa vive in fantamusica_core.py. L'interfaccia supportata è questa app Kivy:
+la vecchia interfaccia a terminale è dismessa.
 
 Funzioni principali
   - Foto per giocatori e musicisti (cartella "foto" accanto ai dati). Nelle liste compaiono come
@@ -16,27 +15,21 @@ Funzioni principali
   - Interfaccia a pulsanti: classifiche, squadre, profili, mercato e scambi, eventi, pending,
     asta, gestione musicisti e utenti, backup/CSV.
 
-Il pannello admin comprende anche gestione azioni, buff/debuff (bonus/malus), caratteristiche
-descrittive dei profili, chiusura stagione e ripristino backup.
+Per l'admin la schermata principale raccoglie tutte le funzioni, organizzate per area:
+eventi, squadre e regole, mercato/asta, stagione/dati e preferenze.
 
 Gioco online (facoltativo): con il file fantamusica_online.json accanto ai dati, questa app sincronizza
 lo stato locale con Supabase. Il gioco web continua anche quando l'app dell'admin è chiusa.
 
 Avvio:  pip install kivy pillow   ->   python3 fantamusica_kivy.py
 """
-import builtins
-import contextlib
 import copy
 import json
-import queue
 import os
 import re
 import secrets
 import shutil
-import ssl
 import threading
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,6 +61,7 @@ from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
+from kivy.uix.togglebutton import ToggleButton
 from kivy.uix.widget import Widget
 from kivy.utils import platform
 
@@ -134,15 +128,8 @@ def assicura_campi(db):
 # --------------------------------------------------------------------------
 # Asta live online (Supabase)
 # --------------------------------------------------------------------------
-ONLINE_FILE = fm.DATA_FILE.with_name("fantamusica_online.json")   # url, anon_key, admin_code, web_url
+ONLINE_FILE = fm.DATA_FILE.with_name("fantamusica_online.json")   # url, anon_key, web_url
 ALFABETO_CODICI = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-
-try:
-    import certifi
-    _SSL = ssl.create_default_context(cafile=certifi.where())
-except Exception:
-    _SSL = ssl.create_default_context()
-
 
 def leggi_online():
     try:
@@ -150,37 +137,11 @@ def leggi_online():
             c = json.load(f)
     except (OSError, ValueError):
         return None
-    return c if c.get("url") and c.get("anon_key") and c.get("admin_code") else None
+    return c if c.get("url") and c.get("anon_key") else None
 
 
 def nuovo_codice():
-    return "".join(secrets.choice(ALFABETO_CODICI) for _ in range(6))
-
-
-def sb_chiama(c, metodo, percorso, corpo=None, timeout=12):
-    dati = None if corpo is None else json.dumps(corpo).encode("utf-8")
-    req = urllib.request.Request(c["url"].rstrip("/") + percorso, data=dati, method=metodo,
-                                 headers={"apikey": c["anon_key"], "Authorization": "Bearer " + c["anon_key"],
-                                          "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:
-            testo = r.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        try:
-            dett = json.loads(e.read().decode("utf-8"))
-            dett = dett.get("message") or dett
-        except Exception:
-            dett = e.reason
-        raise RuntimeError(f"Supabase ha risposto {e.code}: {dett}")
-    return json.loads(testo) if testo else None
-
-
-def sb_rpc(c, nome, **par):
-    return sb_chiama(c, "POST", "/rest/v1/rpc/" + nome, par)
-
-
-def sb_leggi(c, tabella, query):
-    return sb_chiama(c, "GET", f"/rest/v1/{tabella}?{query}")
+    return "".join(secrets.choice(ALFABETO_CODICI) for _ in range(8))
 
 
 def in_thread(lavoro, ok, err=None):
@@ -503,8 +464,6 @@ class FantaApp(App):
         self.stack = []
         self.righe_login = []
         self.live = None
-        self.terminale_attivo = False
-        self.terminale_coda = None
         self._poll = self._conto_ev = None
         self._bg = self._scan = None
         # gioco online (Supabase)
@@ -633,24 +592,110 @@ class FantaApp(App):
 
     def online_avvia(self, *_):
         c = leggi_online()
-        if not c or self.db is None or self.onl:
+        if not c or self.db is None:
             return
-        self.onl = fo.Online(c)
+        if self.onl is None:
+            self.onl = fo.Online(c)
+        if not self.onl.ha_sessione():
+            self.onl_stadio, self.onl_busy = "auth", False
+            self.online_msg("● ACCESSO SUPABASE RICHIESTO", True)
+            if self.me:
+                self.render()
+            return
         self.onl_stadio, self.onl_ver, self.onl_busy = "avvio", None, False
         self.online_msg("● COLLEGO...")
         if self.me:
             self.render()
         self.online_tick()
 
+    def f_login_supabase(self, dopo=None):
+        c = leggi_online()
+        if not c:
+            self.msg("Serve fantamusica_online.json con url e anon_key.")
+            return
+        if self.onl is None:
+            self.onl = fo.Online(c)
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        box.add_widget(L("Accedi con l'account amministratore Supabase Auth. La password non viene salvata.",
+                         wrap=True, colore="accent2", size_hint_y=None, height=dp(54)))
+        email = campo(self.onl.email(), hint="email admin Supabase")
+        password = campo(hint="password Supabase", password=True)
+        box.add_widget(email); box.add_widget(password)
+        rr = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(8))
+        ricorda = CheckBox(active=False, size_hint=(None, None), size=(dp(36), dp(36)))
+        rr.add_widget(ricorda)
+        rr.add_widget(L("Ricordami su questo computer (salva solo il refresh token)", dim=11, wrap=True))
+        box.add_widget(rr)
+        stato = L("", dim=11, wrap=True, size_hint_y=None, height=dp(42))
+        box.add_widget(stato)
+        br = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        ann = NBtn("ANNULLA", colore=attenua(col("accent"), 0.7))
+        acc = NBtn("ACCEDI")
+        br.add_widget(ann); br.add_widget(acc); box.add_widget(br)
+        pop = self.popup("ACCESSO SUPABASE", box, 0.88, 0.72)
+        ann.bind(on_release=lambda *_: pop.dismiss())
+
+        def ok(r):
+            pop.dismiss()
+            self.onl_stadio, self.onl_ver, self.onl_busy = "avvio", None, False
+            self.onl_ultimo_errore = ""
+            self.online_msg("● COLLEGO...")
+            self.online_tick()
+            if dopo:
+                Clock.schedule_once(lambda _dt: dopo(), 0.2)
+            elif self.me:
+                self.render()
+
+        def err(e):
+            stato.text = str(e)
+            stato.color = (1, 0.45, 0.45, 1)
+            acc.disabled = False
+
+        def vai(*_):
+            if not email.text.strip() or not password.text:
+                stato.text = "Inserisci email e password."
+                return
+            acc.disabled = True
+            stato.text = "Accesso in corso..."
+            in_thread(lambda: self.onl.login(email.text, password.text, ricorda=ricorda.active), ok, err)
+
+        password.bind(on_text_validate=vai)
+        acc.bind(on_release=vai)
+
+    def logout_supabase(self):
+        if self.onl:
+            self.onl.logout()
+        self.onl_stadio, self.onl_ver, self.onl_busy = "auth", None, False
+        self.online_msg("● ACCESSO SUPABASE RICHIESTO", True)
+        if self.me:
+            self.render()
+
     def online_errore(self, e):
         self.onl_busy = False
         self.onl_ultimo_errore = str(e)
-        self.online_msg("● OFFLINE", True)
+        msg = self.onl_ultimo_errore.lower()
+        if "accesso supabase admin richiesto" in msg or "sessione supabase" in msg or "401" in msg:
+            self.onl_stadio = "auth"
+            self.online_msg("● ACCESSO SUPABASE RICHIESTO", True)
+        elif "non è autorizzato come admin" in msg or "non appartiene a un admin" in msg or "403" in msg:
+            self.onl_stadio = "auth"
+            self.online_msg("● ACCOUNT NON AUTORIZZATO", True)
+        elif ("push rifiutato" in msg or "controllo di integrità" in msg
+              or "database locale contiene incoerenze" in msg or "validazione server" in msg):
+            # La rete e Supabase Auth stanno funzionando: è soltanto la pubblicazione
+            # dello snapshot generale a essere stata rifiutata. Non chiamarlo OFFLINE.
+            self.online_msg("● CONNESSO — SYNC BLOCCATA", True)
+        else:
+            self.online_msg("● OFFLINE", True)
 
     def online_primo(self, st):
         """Primo contatto all'avvio. Se questo computer ha la sua copia di riferimento (base) si parte da li':
         le modifiche fatte qui (anche dal gioco da terminale) vengono unite a quelle online."""
         self.onl_busy = False
+        # Se fm_a_stato ha risposto, la sessione e la connessione sono valide: non lasciare
+        # una vecchia scritta OFFLINE dovuta a un errore/transitorio precedente.
+        self.onl_ultimo_errore = ""
+        self.onl_err = False
         if st.get("vuoto"):              # online non c'e' ancora nulla: si pubblicano i dati di questo computer
             self.onl_ver, self.onl_base, self.onl_sporco, self.onl_stadio = None, None, True, "attivo"
             self.online_msg("● ONLINE")
@@ -768,7 +813,7 @@ class FantaApp(App):
 
     def online_tick(self, *_):
         """Ogni pochi secondi: guarda la versione online; pubblica le modifiche fatte qui oppure prende le novità."""
-        if not self.onl or self.onl_busy or self.db is None or getattr(self, "terminale_attivo", False):
+        if not self.onl or self.onl_busy or self.db is None:
             return
         if self.onl_stadio == "avvio":
             self.onl_busy = True
@@ -783,6 +828,13 @@ class FantaApp(App):
         if self.onl_stadio != "attivo" or self.db is None:
             self.onl_busy = False
             return
+        # Arrivare qui significa che fm_a_stato ha risposto con successo usando il token Auth.
+        # Ripulisci immediatamente un eventuale OFFLINE rimasto visualizzato da un errore vecchio.
+        self.onl_ultimo_errore = ""
+        if self.onl_err or self.onl_testo == "● OFFLINE":
+            self.online_msg("● ONLINE")
+        else:
+            self.onl_err = False
         if st.get("vuoto") or st["versione"] == self.onl_ver:
             if self.onl_sporco:
                 self.online_invia()
@@ -868,7 +920,14 @@ class FantaApp(App):
 
         def err(e):
             self.onl_sporco = True
+            precedente = self.onl_ultimo_errore
             self.online_errore(e)
+            testo = str(e)
+            # Un push rifiutato non deve restare invisibile: avvisa una volta per errore distinto.
+            if testo != precedente and ("Push rifiutato" in testo or "integrità" in testo or "Validazione server" in testo):
+                Clock.schedule_once(lambda _dt, t=testo: self.msg(
+                    "Supabase è collegato e autenticato, ma la sincronizzazione generale è stata rifiutata.\n\n" + t,
+                    "SYNC BLOCCATA"), 0)
         in_thread(lambda: self.onl.push(dati, base), ok, err)
 
     def online_aggiorna_vista(self):
@@ -901,33 +960,38 @@ class FantaApp(App):
         sv, g = scroll_list(10)
         c = leggi_online()
         if not c:
-            g.add_widget(L("Manca il file fantamusica_online.json accanto ai dati: servono url, anon_key, "
-                           "admin_code e web_url (vedi la guida).", wrap=True))
+            g.add_widget(L("Manca il file fantamusica_online.json accanto ai dati: servono url, anon_key e web_url (vedi la guida).", wrap=True))
         else:
             righe = [f"Stato: {self.onl_testo or 'non collegato'}",
+                     f"Account Supabase: {(self.onl.email() if self.onl and self.onl.ha_sessione() else 'non autenticato')}",
                      f"Versione online: {self.onl_ver if self.onl_ver is not None else '-'}",
                      f"Pagina dei giocatori: {c.get('web_url') or '(scrivi l’indirizzo in web_url dentro fantamusica_online.json)'}",
-                     "Il gioco gira online da solo: giocatori e admin (dal telefono) usano la pagina web. "
-                     "Questa app scarica le novità e pubblica le modifiche fatte qui, unendole a quelle online. "
-                     "Non serve tenerla aperta."]
+                     "Kivy usa Supabase Auth come il web: nessun admin_code locale. La password non viene salvata."]
             if self.onl_ultimo_errore and self.onl_err:
                 righe.append(f"Ultimo errore: {self.onl_ultimo_errore}")
             for r in righe:
                 g.add_widget(L(r, wrap=True, dim=13))
             def pubblica():
-                if not self.onl:
-                    self.online_avvia()
-                else:
-                    self.onl_sporco = True
-                    self.online_tick()
+                if not self.onl or not self.onl.ha_sessione():
+                    self.f_login_supabase(pubblica)
+                    return
+                if self.onl_stadio not in ("avvio", "attivo"):
+                    self.onl_stadio = "avvio"
+                self.onl_sporco = True
+                self.online_tick()
                 self.msg("Pubblicazione avviata: tra qualche secondo i giocatori vedono i dati aggiornati.")
 
             def scarica():
-                if not self.onl:
-                    self.msg("Non sei collegato a Supabase.")
+                if not self.onl or not self.onl.ha_sessione():
+                    self.f_login_supabase(scarica)
                     return
                 self.conferma("Scaricare i dati online? Quelli di questo computer vengono sostituiti "
                               "(prima ne viene fatto un backup).", self.online_scarica, "SCARICA DA ONLINE", "SCARICA")
+            g.add_widget(NBtn("ACCEDI / CAMBIA ACCOUNT SUPABASE", dim=12, height=dp(56),
+                              on_release=lambda *_: self.f_login_supabase()))
+            if self.onl and self.onl.ha_sessione():
+                g.add_widget(NBtn("ESCI DA SUPABASE", dim=12, height=dp(50), colore=attenua(col("accent"), 0.75),
+                                  on_release=lambda *_: self.logout_supabase()))
             for t, f in (("PUBBLICA ORA", pubblica), ("CODICI DEI GIOCATORI", self.f_codici),
                          ("SCARICA I DATI DA ONLINE", scarica)):
                 g.add_widget(NBtn(t, dim=13, height=dp(56), on_release=lambda *_, f=f: f()))
@@ -1091,7 +1155,10 @@ class FantaApp(App):
                 self.msg("Serve il file fantamusica_online.json accanto al programma.")
                 return
             self.onl = fo.Online(c)
-            self.online_scarica()
+            if self.onl.ha_sessione():
+                self.online_scarica()
+            else:
+                self.f_login_supabase(self.online_scarica)
         p.add_widget(NBtn("OPPURE SCARICA I DATI ONLINE", dim=11, colore=col("accent2"), on_release=da_online))
         a.add_widget(p)
         self.corpo.add_widget(a)
@@ -1199,31 +1266,80 @@ class FantaApp(App):
     def v_home(self):
         me = self.me
         p = fm.prefs(me)
-        self.titolo(f"BENVENUTO {p['soprannome'] or me['nome']}".upper())
+        admin = self.e_admin()
+        self.titolo("AMMINISTRAZIONE" if admin else f"BENVENUTO {p['soprannome'] or me['nome']}".upper())
         sv, g = scroll_list(10)
+
         if self.righe_login:
             b = Panel(orientation="vertical", size_hint_y=None, padding=dp(10), spacing=dp(2))
             for r in self.righe_login:
                 b.add_widget(L(r, wrap=True, dim=12))
             b.bind(minimum_height=b.setter("height"))
             g.add_widget(b)
-        griglia = GridLayout(cols=2, spacing=dp(10), size_hint_y=None, row_default_height=dp(78),
-                             row_force_default=True)
-        griglia.bind(minimum_height=griglia.setter("height"))
-        voci = [("CLASSIFICA", lambda: self.vai(self.v_classifica, "giocatori")),
+
+        def gruppo(titolo, voci, altezza=64):
+            self.sezione(g, titolo)
+            griglia = GridLayout(cols=2, spacing=dp(8), size_hint_y=None,
+                                 row_default_height=dp(altezza), row_force_default=True)
+            griglia.bind(minimum_height=griglia.setter("height"))
+            for i, (testo, fn) in enumerate(voci):
+                griglia.add_widget(NBtn(
+                    testo, dim=12, height=dp(altezza),
+                    colore=col("accent2") if i % 4 == 1 else None,
+                    on_release=lambda *_, fn=fn: fn()))
+            g.add_widget(griglia)
+
+        if admin:
+            aperto = self.g.mercato_aperto()
+
+            gruppo("GIOCO, CLASSIFICHE ED EVENTI", [
+                ("CLASSIFICA", lambda: self.vai(self.v_classifica, "giocatori")),
+                ("STATISTICHE", lambda: self.vai(self.v_statistiche, "azioni")),
+                ("REGISTRA EVENTO", lambda: self.f_evento(False)),
+                ("PENDING / CONTROLLO SONDAGGI", lambda: self.vai(self.v_pending)),
+                ("DITTATURA (PUNTEGGIO A MANO)", lambda: self.f_evento(True)),
+                ("ELIMINA UN EVENTO", lambda: self.vai(self.v_elimina_evento)),
+            ])
+
+            gruppo("SQUADRE, UTENTI E REGOLE", [
+                ("LA MIA SQUADRA", lambda: self.vai(self.v_squadra, me["nome"])),
+                ("GESTIONE UTENTI", lambda: self.vai(self.v_gest_utenti)),
+                ("GESTIONE MUSICISTI", lambda: self.vai(self.v_gest_musicisti)),
+                ("GESTIONE AZIONI", lambda: self.vai(self.v_gest_azioni)),
+                ("BONUS E MALUS", lambda: self.vai(self.v_gest_bonus)),
+                ("CARATTERISTICHE DESCRITTIVE", lambda: self.vai(self.v_gest_campi)),
+            ])
+
+            gruppo("MERCATO E ASTA", [
+                ("MERCATO E SCAMBI", lambda: self.vai(self.v_mercato)),
+                (f"MERCATO: {'CHIUDI' if aperto else 'APRI'}", self.toggle_mercato),
+                ("ASTA MUSICISTI", lambda: self.vai(self.v_asta)),
+            ])
+
+            gruppo("STAGIONE, ONLINE E DATI", [
+                ("IMPOSTAZIONI STAGIONE", self.f_impostazioni),
+                ("CHIUDI STAGIONE", self.f_chiudi_stagione_gui),
+                ("GIOCO ONLINE", lambda: self.vai(self.v_online)),
+                ("VERIFICA INTEGRITÀ DEI DATI", self.f_verifica_integrita),
+                ("AUDIT LOG AMMINISTRATIVO", lambda: self.vai(self.v_audit_log)),
+                ("BACKUP / RIPRISTINO / CSV", self.v_backup_popup),
+            ])
+
+            gruppo("ACCOUNT E ASPETTO", [
+                ("ASPETTO E PREFERENZE", lambda: self.vai(self.v_aspetto)),
+                ("CAMBIA ACCOUNT / ESCI", self.esci_account),
+            ])
+        else:
+            gruppo("GIOCO", [
+                ("CLASSIFICA", lambda: self.vai(self.v_classifica, "giocatori")),
                 ("STATISTICHE", lambda: self.vai(self.v_statistiche, "azioni")),
                 ("LA MIA SQUADRA", lambda: self.vai(self.v_squadra, me["nome"])),
-                ("REGISTRA EVENTO" if self.e_admin() else "PROPONI UN EVENTO", lambda: self.f_evento(False)),
+                ("PROPONI UN EVENTO", lambda: self.f_evento(False)),
                 ("MERCATO E SCAMBI", lambda: self.vai(self.v_mercato)),
                 ("ASPETTO E PREFERENZE", lambda: self.vai(self.v_aspetto)),
-                ("MODALITÀ TERMINALE", self.apri_terminale)]
-        if self.e_admin():
-            voci.append(("PANNELLO ADMIN", lambda: self.vai(self.v_admin)))
-        voci.append(("CAMBIA ACCOUNT / ESCI", self.esci_account))
-        for i, (t, f) in enumerate(voci):
-            griglia.add_widget(NBtn(t, dim=15, height=dp(78), colore=col("accent2") if i % 3 == 1 else None,
-                                    on_release=lambda *_, f=f: f()))
-        g.add_widget(griglia)
+                ("CAMBIA ACCOUNT / ESCI", self.esci_account),
+            ], altezza=72)
+
         self.corpo.add_widget(sv)
 
     # ---------- classifica ----------
@@ -1587,7 +1703,11 @@ class FantaApp(App):
         info.add_widget(L(f"{tot_ut.get(nome, 0)} punti", dim=16, colore="accent2"))
         info.add_widget(L(f"crediti {fm.crediti(db, nome)}/{s['budget_iniziale']}", dim=12))
         info.add_widget(L(f"musicisti {len(r)}/{s['musicisti_per_squadra']}", dim=12))
+        profilo_u = u.get("profilo", {})
         for c in fm.campi_per(db, "giocatori"):
+            # Nei profili mostriamo solo le caratteristiche realmente assegnate a questo giocatore.
+            if str(c["id"]) not in profilo_u:
+                continue
             val = fm.valore_profilo(u, c)
             if val != "-":
                 info.add_widget(L(f"{c['nome']}: {val}", dim=11))
@@ -1643,8 +1763,14 @@ class FantaApp(App):
         info.add_widget(L(f"{fm.punti_musicista(db, m['id'])} punti totali", dim=15, colore="accent2"))
         info.add_widget(L(f"squadra: {m['proprietario'] or 'nessuna'}" +
                           (f" ({m['prezzo']} crediti)" if m["proprietario"] else ""), dim=12))
+        profilo_m = m.get("profilo", {})
         for c in fm.campi_per(db, "musicisti"):
-            info.add_widget(L(f"{c['nome']}: {fm.valore_profilo(m, c)}", dim=11))
+            # Evita elenchi infiniti di caratteristiche vuote: compaiono solo quelle possedute.
+            if str(c["id"]) not in profilo_m:
+                continue
+            val = fm.valore_profilo(m, c)
+            if val != "-":
+                info.add_widget(L(f"{c['nome']}: {val}", dim=11))
         top.add_widget(info)
         fissa_info(top, info)
         g.add_widget(top)
@@ -2115,99 +2241,6 @@ class FantaApp(App):
             ("r", "Rilancio minimo", s["rilancio_minimo"], {}),
             ("x", "Scambi a testa per stagione", s.get("scambi_max", fm.SCAMBI_PREDEFINITI), {})], ok)
 
-    # ---------- modalità terminale interna ----------
-    def apri_terminale(self):
-        """Apre la vecchia esperienza a menu numerici dentro la finestra Kivy.
-
-        Non avvia fantamusica.py: esegue il motore condiviso in un thread e collega input/output
-        a due widget Kivy. Durante la sessione la sincronizzazione automatica viene sospesa per
-        evitare che i dati cambino sotto un menu in corso.
-        """
-        if self.terminale_attivo:
-            return
-        self.stack = [(self.v_terminale, ())]
-        self.render()
-
-    def v_terminale(self):
-        self.titolo("MODALITÀ TERMINALE")
-        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(4))
-        out = TextInput(text="", readonly=True, multiline=True, font_name=FONT, font_size=fs(13),
-                        background_normal="", background_active="", background_color=(*col("bg1"), 0.96),
-                        foreground_color=(*col("testo"), 1), cursor_color=(*col("accent"), 1))
-        inp = campo("", hint="Scrivi il numero o la risposta e premi INVIO")
-        box.add_widget(out)
-        box.add_widget(L("Qui non servono pulsanti: usa i menu numerici come nel terminale. Con 0 torni indietro/esci.",
-                         dim=11, colore="accent2", wrap=True, size_hint_y=None, height=dp(42)))
-        box.add_widget(inp)
-        self.corpo.add_widget(box)
-
-        # v_terminale può essere richiamata da un ridisegno: il processo si avvia una sola volta.
-        if self.terminale_attivo:
-            return
-        self.terminale_attivo = True
-        self.terminale_coda = queue.Queue()
-
-        class Writer:
-            def __init__(self, app):
-                self.app = app
-            def write(self, testo):
-                if not testo:
-                    return 0
-                def aggiungi(_dt, t=testo):
-                    if not self.app.terminale_attivo:
-                        return
-                    out.text = (out.text + t)[-60000:]
-                    out.cursor = (len(out.text), 0)
-                    out.scroll_y = 0
-                Clock.schedule_once(aggiungi, 0)
-                return len(testo)
-            def flush(self):
-                pass
-
-        writer = Writer(self)
-
-        def invia(*_):
-            testo = inp.text
-            inp.text = ""
-            if self.terminale_coda is not None:
-                self.terminale_coda.put(testo)
-        inp.bind(on_text_validate=invia)
-        Clock.schedule_once(lambda _dt: setattr(inp, "focus", True), 0.1)
-
-        def leggi(prompt="", password=False):
-            writer.write(prompt)
-            valore = self.terminale_coda.get()
-            writer.write(("*" * len(valore) if password else valore) + "\n")
-            return valore
-
-        def finito(_dt=0):
-            self.terminale_attivo = False
-            self.terminale_coda = None
-            # Il motore ha già salvato le singole operazioni; questo passaggio segnala anche
-            # alla sincronizzazione online che il database locale può essere cambiato.
-            self.me = fm.utente(self.db, self.me["nome"]) or self.me
-            self.g = fm.Gioco(self.db, self.me)
-            self.salva()
-            self.stack = [(self.v_home, ())]
-            self.render()
-
-        def esegui():
-            vecchio_input = builtins.input
-            vecchio_getpass = fm.getpass.getpass
-            try:
-                builtins.input = lambda prompt="": leggi(prompt, False)
-                fm.getpass.getpass = lambda prompt="": leggi(prompt, True)
-                with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                    fm.Gioco(self.db, self.me).avvia()
-            except Exception as e:
-                writer.write(f"\n[ERRORE MODALITÀ TERMINALE: {e}]\n")
-            finally:
-                builtins.input = vecchio_input
-                fm.getpass.getpass = vecchio_getpass
-                Clock.schedule_once(finito, 0)
-
-        threading.Thread(target=esegui, daemon=True).start()
-
     # ---------- gestione azioni (GUI) ----------
     def v_gest_azioni(self):
         if not self._solo_admin:
@@ -2369,6 +2402,11 @@ class FantaApp(App):
 
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
         sv, g = scroll_list(8)
+        # Form volutamente molto lungo: scrollbar più visibile e rotella del mouse più efficace.
+        sv.do_scroll_y = True
+        sv.do_scroll_x = False
+        sv.bar_width = dp(10)
+        sv.scroll_wheel_distance = dp(56)
         g.add_widget(L("I buff/debuff degli eventi si scelgono quando registri l'evento; quelli di musicisti e "
                        "giocatori si applicano automaticamente. La descrizione è facoltativa e compare nelle "
                        "schede e nei dettagli degli eventi.", wrap=True, colore="accent2"))
@@ -2402,11 +2440,66 @@ class FantaApp(App):
         aggiungi_campo("descrizione", "Descrizione / caratteristica del buff o debuff", desc_w, 100)
 
         bers_iniziale = "evento" if b.get("bersaglio", "azione") == "azione" else b.get("bersaglio")
-        bers_w = aggiungi_campo("bersaglio", "Si applica a", spinner(bers_iniziale,
-                                      ["evento", "musicista", "giocatore"]))
+        if bers_iniziale not in ("evento", "musicista", "giocatore"):
+            bers_iniziale = "evento"
+        bers_scelto = {"tipo": bers_iniziale}
 
-        # Il destinatario è uno spinner: niente ID o nomi da ricordare/scrivere.
-        dest_w = aggiungi_campo("dest", "Destinatario", spinner("-", ["-"]))
+        # ToggleButton nativi: selezione esclusiva e stato visibile. Evitiamo sia Spinner sia
+        # pulsanti custom, che dentro alcuni ScrollView Kivy non aggiornavano correttamente lo stato.
+        bers_box = BoxLayout(spacing=dp(6), size_hint_y=None, height=dp(44))
+        bers_btn = {}
+        gruppo = f"bonus-bersaglio-{id(box)}"
+        for _tipo, _testo in (("evento", "EVENTO / AZIONE"), ("musicista", "MUSICISTA"), ("giocatore", "GIOCATORE")):
+            _b = ToggleButton(text=_testo, group=gruppo, allow_no_selection=False,
+                              state="down" if _tipo == bers_iniziale else "normal",
+                              font_name=FONT, font_size=fs(10), bold=True,
+                              background_normal="", background_down="",
+                              background_color=(*col("accent"), 0.34) if _tipo == bers_iniziale else (*col("panel"), 1),
+                              color=(*col("accent2"), 1) if _tipo == bers_iniziale else (*col("testo"), 1),
+                              size_hint_y=None, height=dp(42))
+            bers_btn[_tipo] = _b
+            bers_box.add_widget(_b)
+        aggiungi_campo("bersaglio", "Collegamento", bers_box, 70)
+
+        scelto_lbl = L("", dim=11, colore="accent2", wrap=True, size_hint_y=None, height=dp(30))
+        g.add_widget(scelto_lbl)
+
+        # Il destinatario resta sempre visibile: per evento spiega di usare l'elenco azioni;
+        # per musicista/giocatore apre un popup con lista realmente scorribile.
+        dest_w = aggiungi_campo("dest", "Destinatario", NBtn("", dim=11, height=dp(42)))
+
+        def apri_destinatario(*_):
+            bers = bers_scelto["tipo"]
+            if bers == "musicista":
+                nomi = [m["nome"] for m in sorted(db["musicisti"], key=lambda x: x["nome"].lower())]
+                titolo = "SCEGLI MUSICISTA"
+            elif bers == "giocatore":
+                nomi = [u["nome"] for u in sorted(db["utenti"], key=lambda x: x["nome"].lower()) if u.get("gioca")]
+                titolo = "SCEGLI GIOCATORE"
+            else:
+                self.msg("Questo bonus è collegato a EVENTO / AZIONE: scegli sotto i tipi di evento in cui sarà disponibile.")
+                return
+            if not nomi:
+                self.msg("Non ci sono destinatari disponibili per questo tipo.")
+                return
+            bx = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+            svd, gd = scroll_list(6)
+            svd.do_scroll_y = True; svd.do_scroll_x = False
+            svd.bar_width = dp(10); svd.scroll_wheel_distance = dp(56)
+            bx.add_widget(svd)
+            chiudi = NBtn("ANNULLA", colore=attenua(col("accent"), 0.7), height=dp(42))
+            bx.add_widget(chiudi)
+            popd = self.popup(titolo, bx, 0.86, 0.86)
+
+            def scegli(nome):
+                dest_w.text = nome
+                popd.dismiss()
+
+            for nome in nomi:
+                gd.add_widget(NBtn(nome, dim=11, height=dp(44), on_release=lambda *_, n=nome: scegli(n)))
+            chiudi.bind(on_release=lambda *_: popd.dismiss())
+
+        dest_w.bind(on_release=apri_destinatario)
 
         durata_db = b.get("durata", "permanente")
         durata_ui = "a tempo" if durata_db in ("a_tempo", "date") else durata_db
@@ -2442,37 +2535,43 @@ class FantaApp(App):
                 r.disabled = not si
 
         def sync_durata(*_):
-            automatico = bers_w.text in ("musicista", "giocatore")
+            automatico = bers_scelto["tipo"] in ("musicista", "giocatore")
             mostra("durata", automatico)
             mostra("eventi", automatico and durata_w.text == "eventi")
             temporaneo = automatico and durata_w.text == "a tempo"
             mostra("da", temporaneo)
             mostra("a", temporaneo)
 
-        def sync_bersaglio(*_):
-            bers = bers_w.text
-            evento = bers == "evento"
+        def sync_bersaglio(tipo):
+            bers_scelto["tipo"] = tipo
+            evento = tipo == "evento"
             mostra_azioni(evento)
-            mostra("dest", not evento)
-            if bers == "musicista":
-                nomi = [m["nome"] for m in sorted(db["musicisti"], key=lambda x: x["nome"].lower())]
+            scelto_lbl.text = "Collegamento selezionato: " + ("EVENTO / AZIONE" if evento else tipo.upper())
+            if tipo == "musicista":
                 corrente = fm.nome_musicista(db, b.get("musicista_id")) if b.get("musicista_id") else None
-            elif bers == "giocatore":
-                nomi = [u["nome"] for u in sorted(db["utenti"], key=lambda x: x["nome"].lower()) if u.get("gioca")]
+                dest_w.text = corrente or "SCEGLI MUSICISTA"
+                dest_w.disabled = False
+            elif tipo == "giocatore":
                 corrente = b.get("giocatore")
+                dest_w.text = corrente or "SCEGLI GIOCATORE"
+                dest_w.disabled = False
             else:
-                nomi, corrente = [], None
-            valori = nomi or ["-"]
-            dest_w.values = valori
-            if corrente in valori:
-                dest_w.text = corrente
-            elif dest_w.text not in valori:
-                dest_w.text = valori[0]
+                dest_w.text = "USA LE AZIONI / TIPI DI EVENTO QUI SOTTO"
+                dest_w.disabled = False
+            for k, btn in bers_btn.items():
+                attivo = (k == tipo)
+                btn.background_color = (*col("accent"), 0.34) if attivo else (*col("panel"), 1)
+                btn.color = (*col("accent2"), 1) if attivo else (*col("testo"), 1)
             sync_durata()
 
-        bers_w.bind(text=sync_bersaglio)
+        def on_toggle(tipo, btn, stato):
+            if stato == "down":
+                sync_bersaglio(tipo)
+
+        for _tipo, _btn in bers_btn.items():
+            _btn.bind(state=lambda btn, stato, t=_tipo: on_toggle(t, btn, stato))
         durata_w.bind(text=sync_durata)
-        sync_bersaglio()
+        sync_bersaglio(bers_iniziale)
 
         box.add_widget(sv)
         pulsanti = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
@@ -2491,7 +2590,7 @@ class FantaApp(App):
             if any(x is not b and x["nome"].lower() == nome.lower() for x in db["bonus"]):
                 self.msg("Esiste già un bonus/malus con questo nome."); return
 
-            bers_ui = bers_w.text
+            bers_ui = bers_scelto["tipo"]
             bers = "azione" if bers_ui == "evento" else bers_ui
             mid = None; gioc = None
             if bers == "musicista":
@@ -2674,36 +2773,93 @@ class FantaApp(App):
         chiudi.bind(on_release=lambda *_: pop.dismiss())
 
 
-    # ---------- pannello admin ----------
+    # ---------- compatibilità: il vecchio pannello admin confluisce nella home ----------
     def v_admin(self):
         if not self._solo_admin:
             return self.indietro()
-        self.titolo("PANNELLO ADMIN")
-        sv, g = scroll_list(10)
-        aperto = self.g.mercato_aperto()
-        griglia = GridLayout(cols=2, spacing=dp(10), size_hint_y=None, row_default_height=dp(70),
-                             row_force_default=True)
-        griglia.bind(minimum_height=griglia.setter("height"))
-        voci = [("DITTATURA (punteggio a mano)", lambda: self.f_evento(True)),
-                ("PENDING: CONTROLLO SONDAGGI", lambda: self.vai(self.v_pending)),
-                ("ASTA MUSICISTI", lambda: self.vai(self.v_asta)),
-                ("GESTIONE MUSICISTI", lambda: self.vai(self.v_gest_musicisti)),
-                ("GESTIONE UTENTI", lambda: self.vai(self.v_gest_utenti)),
-                ("GESTIONE AZIONI", lambda: self.vai(self.v_gest_azioni)),
-                ("BONUS E MALUS", lambda: self.vai(self.v_gest_bonus)),
-                ("CARATTERISTICHE DESCRITTIVE", lambda: self.vai(self.v_gest_campi)),
-                ("ELIMINA UN EVENTO", lambda: self.vai(self.v_elimina_evento)),
-                ("VERIFICA INTEGRITÀ DEI DATI", self.f_verifica_integrita),
-                ("STATISTICHE", lambda: self.vai(self.v_statistiche, "azioni")),
-                (f"MERCATO: {'CHIUDI' if aperto else 'APRI'}", self.toggle_mercato),
-                ("IMPOSTAZIONI STAGIONE", self.f_impostazioni),
-                ("CHIUDI STAGIONE", self.f_chiudi_stagione_gui),
-                ("GIOCO ONLINE", lambda: self.vai(self.v_online)),
-                ("BACKUP / RIPRISTINO / CSV", self.v_backup_popup)]
-        for t, f in voci:
-            griglia.add_widget(NBtn(t, dim=12, height=dp(70), on_release=lambda *_, f=f: f()))
-        g.add_widget(griglia)
+        self.v_home()
+
+    def v_audit_log(self):
+        """Storico amministrativo centrale, letto da Supabase."""
+        if not self._solo_admin:
+            return self.indietro()
+        self.titolo("AUDIT LOG AMMINISTRATIVO")
+        sv, g = scroll_list(8)
+        sv.bar_width = dp(8)
         self.corpo.add_widget(sv)
+
+        def intestazione(testo=None, errore=False):
+            g.add_widget(L("Storico server-side delle modifiche amministrative. I codici e le password non vengono "
+                           "mai salvati nel log.", wrap=True, dim=11, colore="accent2",
+                           size_hint_y=None, height=dp(46)))
+            g.add_widget(NBtn("AGGIORNA", dim=11, height=dp(40), on_release=lambda *_: carica()))
+            if testo:
+                g.add_widget(L(testo, wrap=True, dim=11, colore=(1.0, 0.35, 0.35) if errore else "testo",
+                               size_hint_y=None, height=dp(42)))
+
+        def data_locale(v):
+            if not v:
+                return ""
+            try:
+                x = str(v).replace("Z", "+00:00")
+                d = datetime.fromisoformat(x).astimezone()
+                return d.strftime("%d/%m/%Y %H:%M:%S")
+            except Exception:
+                return str(v).replace("T", " ")[:19]
+
+        def dettaglio(voce):
+            box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+            box.add_widget(L(f"{voce.get('azione','')}  //  {voce.get('actor_nome','')}  //  "
+                             f"{data_locale(voce.get('creato'))}", wrap=True, dim=11, colore="accent2",
+                             size_hint_y=None, height=dp(48)))
+            box.add_widget(L(voce.get("riepilogo", ""), wrap=True, dim=12,
+                             size_hint_y=None, height=dp(58)))
+            txt = json.dumps(voce.get("dettagli") or {}, ensure_ascii=False, indent=2)
+            area = TextInput(text=txt, readonly=True, multiline=True, font_name=FONT, font_size=fs(11),
+                             background_normal="", background_active="", background_color=(*col("bg1"), 1),
+                             foreground_color=(*col("testo"), 1), cursor_color=(*col("accent"), 1))
+            box.add_widget(area)
+            chiudi = NBtn("CHIUDI", height=dp(42)); box.add_widget(chiudi)
+            pop = self.popup("DETTAGLIO AUDIT", box, .9, .82)
+            chiudi.bind(on_release=lambda *_: pop.dismiss())
+
+        accumulo = []
+
+        def mostra(r, aggiungi=False):
+            nuove = r.get("righe", []) if isinstance(r, dict) else []
+            if not aggiungi:
+                accumulo.clear()
+            accumulo.extend(nuove)
+            g.clear_widgets()
+            intestazione()
+            if not accumulo:
+                g.add_widget(L("Nessuna voce nel log.", wrap=True))
+                return
+            for voce in accumulo:
+                quando = data_locale(voce.get("creato"))
+                sotto = f"{quando}  //  {voce.get('actor_nome','?')}  //  {voce.get('fonte','')}"
+                g.add_widget(self.riga(None, voce.get("azione", "MODIFICA"), voce.get("riepilogo", ""),
+                                       sotto, azione=lambda v=voce: dettaglio(v), h=76))
+            if len(nuove) >= 100 and accumulo:
+                g.add_widget(NBtn("CARICA 100 PRECEDENTI", dim=11, height=dp(42),
+                                  on_release=lambda *_: carica(accumulo[-1].get("id"), True)))
+
+        def errore(e):
+            g.clear_widgets()
+            intestazione(f"Impossibile leggere il log: {e}", True)
+
+        def carica(prima_id=None, aggiungi=False):
+            if not aggiungi:
+                g.clear_widgets()
+                intestazione("Caricamento...")
+            if not self.onl:
+                g.clear_widgets()
+                intestazione("Il log centrale è disponibile quando il gioco online è configurato e collegato.", True)
+                return
+            in_thread(lambda: self.onl.audit(prima_id=prima_id, limite=100),
+                      lambda r: mostra(r, aggiungi), errore)
+
+        carica()
 
     def toggle_mercato(self):
         s = self.db["impostazioni"]
@@ -3180,32 +3336,26 @@ class FantaApp(App):
                 self.msg("Col gioco online squadre, crediti e codici dell'asta si aggiornano da soli.")
             self.live_poll()
             return
-        sq, mu, co = self.payload_sync()
-        c = st["c"]
-
-        def ok(r):
-            if self.live is not st:
-                return
-            if r and r.get("ok") is False:
-                self.live_stato(f"Sincronizzazione fallita: {r.get('errore')}", True)
-                if mostra:
-                    self.msg(f"Sincronizzazione fallita: {r.get('errore')}")
-                return
-            self.live_stato("Sincronizzato con Supabase")
-            if mostra:
-                self.msg("Giocatori, crediti e musicisti sincronizzati.")
-            self.live_poll()
-        in_thread(lambda: sb_rpc(c, "asta_a_sync", p_admin=c["admin_code"], p_squadre=sq, p_musicisti=mu,
-                                 p_codici=co), ok, self.live_errore)
+        self.live_stato("Accesso Supabase richiesto", True)
+        if mostra:
+            self.f_login_supabase(lambda: self.live_sync(True))
 
     def asta_live(self):
         c = leggi_online()
         if not c:
             self.corpo.add_widget(L("Manca il file di configurazione fantamusica_online.json accanto ai dati "
-                                    "(servono url, anon_key e admin_code).", wrap=True))
+                                    "(servono url e anon_key).", wrap=True))
+            return
+        if self.onl is None:
+            self.onl = fo.Online(c)
+        if not self.onl.ha_sessione():
+            box = BoxLayout(orientation="vertical", spacing=dp(8))
+            box.add_widget(L("Per usare l'asta live devi accedere con un account admin Supabase.", wrap=True))
+            box.add_widget(NBtn("ACCEDI A SUPABASE", on_release=lambda *_: self.f_login_supabase(self.render)))
+            self.corpo.add_widget(box)
             return
         db = self.db
-        st = self.live = {"c": c, "busy": False}
+        st = self.live = {"busy": False}
         cont = BoxLayout(orientation="vertical", spacing=dp(6))
         self.corpo.add_widget(cont)
         st["stato"] = L("Connessione in corso...", dim=11, colore="accent2", size_hint_y=None, height=dp(20))
@@ -3254,15 +3404,11 @@ class FantaApp(App):
         if not st or st["busy"]:
             return
         st["busy"] = True
-        c = st["c"]
-
         def lavoro():
-            corr = (sb_leggi(c, "asta_corrente", "select=*&id=eq.1") or [{}])[0]
-            off = sb_leggi(c, "asta_offerte", f"select=*&musicista_id=eq.{corr['musicista_id']}&order=id.desc&limit=20") \
-                if corr.get("musicista_id") is not None else []
-            msgs = sb_leggi(c, "asta_messaggi", "select=*&order=id.desc&limit=15")
-            sq = sb_leggi(c, "asta_squadre", "select=nome,crediti,posti,visto&order=nome")
-            return corr, off, msgs, sq
+            if not self.onl:
+                raise RuntimeError("Accesso Supabase richiesto")
+            r = self.onl.rpc("asta_leggi")
+            return r.get("corr") or {}, r.get("offerte") or [], r.get("messaggi") or [], r.get("squadre") or []
 
         def ok(dati):
             st["busy"] = False
@@ -3310,8 +3456,10 @@ class FantaApp(App):
         st = self.live
         if not st:
             return
-        c = st["c"]
-        in_thread(lambda: sb_rpc(c, rpc, p_admin=c["admin_code"], **par), ok, self.live_errore)
+        if not self.onl:
+            self.live_errore(RuntimeError("Accesso Supabase richiesto"))
+            return
+        in_thread(lambda: self.onl.rpc(rpc, p_admin=None, **par), ok, self.live_errore)
 
     def live_invia(self, testo):
         def ok(r):
@@ -3411,19 +3559,47 @@ class FantaApp(App):
         c = leggi_online() or {}
         fo.assicura_codici(db)
         self.salva()
-        testo = "\n".join(f"{u['nome']}: {u['codice_asta']}" for u in db["utenti"]) or "Nessun utente."
         web = c.get("web_url") or "(scrivi l'indirizzo della pagina web in web_url dentro fantamusica_online.json)"
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
         sv, g = scroll_list()
         g.add_widget(L("Pagina dei giocatori: " + web, wrap=True, colore="accent2", dim=12))
-        g.add_widget(L(testo, wrap=True))
+        g.add_widget(L("I codici sono inviti di associazione: il giocatore li usa una volta sul proprio dispositivo. "
+                       "Dopo l'uso la sessione resta sul dispositivo; per un nuovo telefono genera un NUOVO codice.",
+                       wrap=True, dim=11))
+
+        def fmt(cod):
+            cod = (cod or "").upper()
+            return cod[:4] + "-" + cod[4:] if len(cod) == 8 else cod
+
+        def copia_testo():
+            return "\n".join(f"{u['nome']}: {fmt(u.get('codice_asta'))}" for u in db["utenti"]) or "Nessun utente."
+
+        for u in db["utenti"]:
+            r = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+            r.add_widget(L(f"{u['nome']}: {fmt(u.get('codice_asta'))}", dim=12, colore="accent2", shorten=True))
+
+            def uno(*_, u=u):
+                usati = {x.get("codice_asta") for x in db["utenti"] if x is not u and x.get("codice_asta")}
+                nc = fo.nuovo_codice()
+                while nc in usati:
+                    nc = fo.nuovo_codice()
+                u["codice_asta"] = nc
+                self.salva()
+                pop.dismiss()
+                if self.live:
+                    self.live_sync(True)
+                Clock.schedule_once(lambda dt: self.f_codici(), 0.2)
+
+            r.add_widget(NBtn("NUOVO", dim=10, size_hint_x=None, width=dp(92), on_release=uno))
+            g.add_widget(r)
         box.add_widget(sv)
-        pop = self.popup("CODICI DEI GIOCATORI", box, 0.9, 0.8)
+        pop = self.popup("CODICI DI ASSOCIAZIONE", box, 0.92, 0.86)
 
         def copia(*_):
             try:
                 from kivy.core.clipboard import Clipboard
-                Clipboard.copy(f"{web}\n{testo}")
+                Clipboard.copy(f"{web}\n{copia_testo()}")
+                self.msg("Codici copiati.")
             except Exception:
                 self.msg("Copia non disponibile su questo sistema.")
 
@@ -3436,9 +3612,10 @@ class FantaApp(App):
                 pop.dismiss()
                 if self.live:
                     self.live_sync(True)
-            self.conferma("Rigenerare tutti i codici? I vecchi smettono di funzionare e vanno ridati ai giocatori.", ok)
+            self.conferma("Generare un nuovo codice per tutti? I vecchi inviti non ancora usati smettono di funzionare. "
+                          "Le sessioni già associate restano valide.", ok)
         box.add_widget(NBtn("COPIA TUTTO", dim=12, on_release=copia))
-        box.add_widget(NBtn("RIGENERA I CODICI", dim=12, on_release=rigenera))
+        box.add_widget(NBtn("NUOVI CODICI PER TUTTI", dim=12, on_release=rigenera))
         box.add_widget(NBtn("CHIUDI", colore=attenua(col("accent"), 0.7), on_release=lambda *_: pop.dismiss()))
 
     def asta_locale(self):

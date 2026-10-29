@@ -2,9 +2,8 @@
 """
 FANTABANDA - collegamento online (Supabase)
 
-Questo modulo NON ha grafica: lo usa l'app Kivy (fantamusica_kivy.py) e si puo' usare anche da terminale:
-
-    python3 fm_online.py sincronizza      unisce i dati di questo computer con quelli online
+Questo modulo NON ha grafica: è la libreria di sincronizzazione usata da fantamusica_kivy.py.
+La vecchia sincronizzazione manuale da terminale è dismessa.
 
 Come funziona
   * Il gioco vive ONLINE (Supabase): le regole per le richieste dei giocatori e per le operazioni
@@ -18,8 +17,9 @@ Come funziona
 import copy
 import json
 import secrets
-import sys
 import ssl
+import os
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -36,24 +36,27 @@ except Exception:
 
 
 # --------------------------------------------------------------------------
-# Codici personali dei giocatori
+# Codici di associazione dei giocatori
 # --------------------------------------------------------------------------
-def nuovo_codice(n=6):
+def nuovo_codice(n=8):
     return "".join(secrets.choice(ALFABETO_CODICI) for _ in range(n))
 
 
 def assicura_codici(db):
-    """Dà un codice personale (campo codice_asta) a chi non ce l'ha; i codici sono tutti diversi.
+    """Dà un codice di associazione (campo codice_asta) a chi non ce l'ha; i codici sono tutti diversi.
     Ritorna True se ha modificato qualcosa."""
     cambiato = False
     usati = set()
     for u in db["utenti"]:
-        c = (u.get("codice_asta") or "").upper()
-        if c and c not in usati:
+        c = (u.get("codice_asta") or "").upper().replace("-", "").replace(" ", "")
+        valido = len(c) == 8 and all(ch in ALFABETO_CODICI for ch in c)
+        if valido and c not in usati:
             usati.add(c)
             if c != u.get("codice_asta"):
                 u["codice_asta"], cambiato = c, True
         else:
+            if u.get("codice_asta") is not None:
+                cambiato = True
             u["codice_asta"] = None
     for u in db["utenti"]:
         if not u.get("codice_asta"):
@@ -83,53 +86,235 @@ class ErroreOnline(RuntimeError):
 
 
 class Online:
-    """Client minimale per le funzioni SQL di supabase_gioco.sql (nessuna libreria esterna)."""
+    """Client Supabase per l'admin locale, autenticato con Supabase Auth.
+
+    La password non viene mai salvata. Se l'utente sceglie "ricordami", viene
+    salvato soltanto il refresh token in ``fantamusica_online_auth.json``.
+    """
+
+    AUTH_FILE = fm.DATA_FILE.with_name("fantamusica_online_auth.json")
 
     def __init__(self, cfg, timeout=15):
         self.url = cfg["url"].rstrip("/")
         self.chiave = cfg["anon_key"]
-        self.admin = cfg["admin_code"]
         self.timeout = timeout
+        self.sessione = None
+        self.ricorda = False
+        self._carica_sessione()
+
+    # ----- sessione Supabase Auth -----
+    def _carica_sessione(self):
+        try:
+            with open(self.AUTH_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and d.get("refresh_token"):
+                self.sessione = d
+                self.ricorda = True
+        except (OSError, ValueError, TypeError):
+            self.sessione = None
+            self.ricorda = False
+
+    def _salva_sessione(self):
+        if not self.ricorda or not self.sessione:
+            return
+        d = {
+            "access_token": self.sessione.get("access_token"),
+            "refresh_token": self.sessione.get("refresh_token"),
+            "expires_at": self.sessione.get("expires_at"),
+            "email": self.sessione.get("email"),
+        }
+        tmp = self.AUTH_FILE.with_suffix(self.AUTH_FILE.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, self.AUTH_FILE)
+        try:
+            os.chmod(self.AUTH_FILE, 0o600)
+        except OSError:
+            pass
+
+    def _elimina_sessione_salvata(self):
+        try:
+            self.AUTH_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def ha_sessione(self):
+        return bool(self.sessione and (self.sessione.get("access_token") or self.sessione.get("refresh_token")))
+
+    def email(self):
+        return (self.sessione or {}).get("email") or ""
+
+    def _http_json(self, metodo, percorso, corpo=None, bearer=None):
+        dati = None if corpo is None else json.dumps(corpo, ensure_ascii=False).encode("utf-8")
+        headers = {"apikey": self.chiave, "Content-Type": "application/json"}
+        if bearer:
+            headers["Authorization"] = "Bearer " + bearer
+        req = urllib.request.Request(self.url + percorso, data=dati, method=metodo, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=_SSL) as r:
+                testo = r.read().decode("utf-8")
+                return json.loads(testo) if testo else None
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read().decode("utf-8")
+                dett = json.loads(raw) if raw else {}
+                msg = dett.get("msg") or dett.get("message") or dett.get("error_description") or dett.get("error") or dett
+            except Exception:
+                msg = e.reason
+            raise ErroreOnline(f"Supabase ha risposto {e.code}: {msg}")
+        except (urllib.error.URLError, OSError) as e:
+            raise ErroreOnline(f"Nessuna connessione a Supabase: {getattr(e, 'reason', e)}")
+
+    def _imposta_sessione(self, r, ricorda=None):
+        if not isinstance(r, dict) or not r.get("access_token"):
+            raise ErroreOnline("Supabase non ha restituito una sessione valida")
+        if ricorda is not None:
+            self.ricorda = bool(ricorda)
+        user = r.get("user") if isinstance(r.get("user"), dict) else {}
+        expires_at = r.get("expires_at")
+        if not expires_at:
+            expires_at = int(time.time()) + int(r.get("expires_in") or 3600)
+        self.sessione = {
+            "access_token": r.get("access_token"),
+            "refresh_token": r.get("refresh_token") or (self.sessione or {}).get("refresh_token"),
+            "expires_at": int(expires_at),
+            "email": user.get("email") or r.get("email") or (self.sessione or {}).get("email"),
+        }
+        if self.ricorda:
+            self._salva_sessione()
+        else:
+            self._elimina_sessione_salvata()
+
+    def login(self, email, password, ricorda=False):
+        email = str(email or "").strip().lower()
+        if not email or not password:
+            raise ErroreOnline("Inserisci email e password dell'admin Supabase")
+        r = self._http_json("POST", "/auth/v1/token?grant_type=password",
+                            {"email": email, "password": password})
+        self._imposta_sessione(r, ricorda=ricorda)
+        st = self.rpc("fm_auth_stato")
+        if not isinstance(st, dict) or not st.get("admin"):
+            self.logout()
+            raise ErroreOnline("L'account Supabase è valido ma non è autorizzato come admin FantaBanda")
+        return {"ok": True, "email": self.email(), "admin": True}
+
+    def refresh(self):
+        rt = (self.sessione or {}).get("refresh_token")
+        if not rt:
+            raise ErroreOnline("Accesso Supabase admin richiesto")
+        r = self._http_json("POST", "/auth/v1/token?grant_type=refresh_token", {"refresh_token": rt})
+        self._imposta_sessione(r)
+        return self.sessione
+
+    def logout(self):
+        token = (self.sessione or {}).get("access_token")
+        if token:
+            try:
+                self._http_json("POST", "/auth/v1/logout", {}, bearer=token)
+            except Exception:
+                pass
+        self.sessione = None
+        self.ricorda = False
+        self._elimina_sessione_salvata()
+
+    def _token(self):
+        if not self.sessione:
+            raise ErroreOnline("Accesso Supabase admin richiesto")
+        exp = int(self.sessione.get("expires_at") or 0)
+        if not self.sessione.get("access_token") or exp <= int(time.time()) + 45:
+            self.refresh()
+        return self.sessione["access_token"]
 
     def rpc(self, nome, **par):
         r = self.grezzo(nome, **par)
         if isinstance(r, dict) and r.get("ok") is False and not r.get("conflitto"):
-            raise ErroreOnline(r.get("errore") or "Operazione rifiutata")
+            msg = r.get("errore") or "Operazione rifiutata"
+            problemi = r.get("problemi")
+            if isinstance(problemi, list) and problemi:
+                righe = [str(x) for x in problemi[:8]]
+                if len(problemi) > 8:
+                    righe.append(f"... e altri {len(problemi) - 8} problemi")
+                msg += "\n\nDettagli:\n- " + "\n- ".join(righe)
+            raise ErroreOnline(msg)
         return r
 
     def grezzo(self, nome, **par):
         """Come rpc ma senza sollevare errori quando la funzione risponde ok=false."""
         dati = json.dumps(par, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.url}/rest/v1/rpc/{nome}", data=dati, method="POST",
-            headers={"apikey": self.chiave, "Authorization": "Bearer " + self.chiave,
-                     "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout, context=_SSL) as r:
-                testo = r.read().decode("utf-8")
-        except urllib.error.HTTPError as e:
+        for tentativo in range(2):
+            token = self._token()
+            req = urllib.request.Request(
+                f"{self.url}/rest/v1/rpc/{nome}", data=dati, method="POST",
+                headers={"apikey": self.chiave, "Authorization": "Bearer " + token,
+                         "Content-Type": "application/json"})
             try:
-                dett = json.loads(e.read().decode("utf-8"))
-                dett = dett.get("message") or dett
-            except Exception:
-                dett = e.reason
-            raise ErroreOnline(f"Supabase ha risposto {e.code}: {dett}")
-        except (urllib.error.URLError, OSError) as e:
-            raise ErroreOnline(f"Nessuna connessione a Supabase: {getattr(e, 'reason', e)}")
-        return json.loads(testo) if testo else None
+                with urllib.request.urlopen(req, timeout=self.timeout, context=_SSL) as r:
+                    testo = r.read().decode("utf-8")
+                return json.loads(testo) if testo else None
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and tentativo == 0 and (self.sessione or {}).get("refresh_token"):
+                    try:
+                        self.refresh()
+                        continue
+                    except Exception:
+                        pass
+                try:
+                    raw = e.read().decode("utf-8")
+                    dett = json.loads(raw) if raw else {}
+                    dett = dett.get("message") or dett.get("msg") or dett
+                except Exception:
+                    dett = e.reason
+                raise ErroreOnline(f"Supabase ha risposto {e.code}: {dett}")
+            except (urllib.error.URLError, OSError) as e:
+                raise ErroreOnline(f"Nessuna connessione a Supabase: {getattr(e, 'reason', e)}")
+        raise ErroreOnline("Sessione Supabase non valida")
 
     # ----- stato -----
     def stato(self):
-        return self.rpc("fm_a_stato", p_admin=self.admin)
+        return self.rpc("fm_a_stato", p_admin=None)
 
     def push(self, dati, versione_base=None):
-        """Pubblica il database (dati = copia_dati(db)). Ritorna la risposta: ok/conflitto/versione."""
-        return self.rpc("fm_a_push", p_admin=self.admin, p_dati=dati, p_codici=codici(dati),
+        """Pubblica il database dopo un pre-controllo locale; Supabase lo rivalida comunque sul server."""
+        validatore = getattr(fm, "valida_integrita", None)
+        if callable(validatore):
+            try:
+                problemi = validatore(dati)
+            except Exception as e:
+                raise ErroreOnline(f"Impossibile verificare l'integrità del database locale: {e}") from e
+            if problemi:
+                righe = [str(x) for x in problemi[:8]]
+                if len(problemi) > 8:
+                    righe.append(f"... e altri {len(problemi) - 8} problemi")
+                raise ErroreOnline("Il database locale contiene incoerenze e non verrà pubblicato:\n- "
+                                   + "\n- ".join(righe))
+        return self.rpc("fm_a_push", p_admin=None, p_dati=dati, p_codici=codici(dati),
                         p_base=versione_base)
 
     def scarica(self):
-        r = self.rpc("fm_a_scarica", p_admin=self.admin)
+        r = self.rpc("fm_a_scarica", p_admin=None)
         return r["versione"], r["dati"]
+
+    def audit(self, prima_id=None, limite=100):
+        par = {"p_admin": None, "p_limite": int(limite)}
+        if prima_id is not None:
+            par["p_prima_id"] = int(prima_id)
+        return self.rpc("fm_audit_elenco", **par)
+
+    def assicura_admin(self):
+        st = self.rpc("fm_auth_stato")
+        if not isinstance(st, dict) or not st.get("admin"):
+            raise ErroreOnline("La sessione Supabase non appartiene a un admin FantaBanda")
+        return True
+
+    def verifica_snapshot(self, dati=None):
+        """Valida uno snapshot sul server senza salvarlo. Se dati=None controlla quello già online."""
+        return self.grezzo("fm_a_verifica_snapshot", p_dati=dati)
 
 
 # --------------------------------------------------------------------------
@@ -520,10 +705,15 @@ def unisci(base, locale, remoto):
 # --------------------------------------------------------------------------
 # Sincronizzazione da terminale (senza l'app): python3 fm_online.py sincronizza
 # --------------------------------------------------------------------------
-def sincronizza(cfg, db, scelta=None):
+def sincronizza(cfg, db, scelta=None, on=None):
     """Porta online le modifiche fatte su questo computer e scarica le novita'. Ritorna (db, messaggio).
-    scelta: None (automatico), 'locali' (sovrascrive online), 'online' (sostituisce i dati locali)."""
-    on = Online(cfg)
+    scelta: None (automatico), 'locali' (sovrascrive online), 'online' (sostituisce i dati locali).
+
+    ``on`` permette al chiamante (Kivy/CLI) di riusare il client Online gia' autenticato,
+    evitando di perdere la sessione Supabase Auth appena creata.
+    """
+    if on is None:
+        on = Online(cfg)
     st = on.stato()
     base = leggi_base()
     if st.get("vuoto") or scelta == "locali":
@@ -568,31 +758,12 @@ def sincronizza(cfg, db, scelta=None):
     raise ErroreOnline("Online i dati cambiano troppo spesso in questo momento: riprova tra poco")
 
 
-def main(argv):
-    if len(argv) < 2 or argv[1] != "sincronizza":
-        print(__doc__)
-        return 1
-    scelta = argv[2] if len(argv) > 2 and argv[2] in ("locali", "online") else None
-    try:
-        with open(fm.DATA_FILE.with_name("fantamusica_online.json"), encoding="utf-8") as f:
-            cfg = json.load(f)
-    except (OSError, ValueError):
-        print("Manca fantamusica_online.json accanto ai dati.")
-        return 1
-    db = fm.carica()
-    if db is None and scelta != "online":
-        print("Su questo computer non ci sono dati: usa 'python3 fm_online.py sincronizza online'.")
-        return 1
-    try:
-        nuovo, msg = sincronizza(cfg, db, scelta)
-    except ErroreOnline as e:
-        print(e)
-        return 1
-    fm.migra(nuovo)
-    fm.salva(nuovo)
-    print(msg)
-    return 0
+def main(argv=None):
+    """Entry point legacy: la sincronizzazione si gestisce ora dall'app Kivy."""
+    print("La sincronizzazione da terminale è stata dismessa.")
+    print("Usa l'app: python3 fantamusica_kivy.py")
+    return 2
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    raise SystemExit(main())

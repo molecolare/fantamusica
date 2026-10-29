@@ -47,8 +47,8 @@ Ruoli
                   e gestisce le proprie preferenze personali (soprannome, riepilogo
                   all'accesso, recupero password...)
 
-Avvio:  python3 fantamusica.py
-I dati sono salvati in fantamusica_dati.json (accanto allo script). Il pannello admin ha
+Avvio supportato:  python3 fantamusica_kivy.py
+I dati sono salvati in fantamusica_dati.json (accanto allo script). La schermata admin unica ha
 "Backup ed esportazione": backup datati (cartella backup/, anche in automatico a ogni chiusura
 stagione), ripristino, esportazione/importazione dell'intero database e CSV di classifiche ed eventi.
 I salvataggi delle versioni precedenti vengono aggiornati in automatico all'apertura.

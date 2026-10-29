@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Compatibilità con la vecchia versione a terminale di FantaMusica.
+"""Launcher di compatibilità FantaBanda.
 
-La logica condivisa vive ora in ``fantamusica_core.py``. L'app principale è
-``fantamusica_kivy.py`` e non dipende più da questo file. Questo wrapper resta
-solo per chi vuole ancora avviare esplicitamente la vecchia CLI.
+La vecchia interfaccia a terminale è dismessa.
+L'app supportata è ``fantamusica_kivy.py``.
 """
-from fantamusica_core import *  # noqa: F401,F403
-from fantamusica_core import main as _main
+import sys
+
+
+def main():
+    if len(sys.argv) > 1:
+        print("La modalità terminale e i comandi CLI sono stati dismessi.")
+        print("Avvia FantaBanda con: python3 fantamusica_kivy.py")
+        return 2
+
+    from fantamusica_kivy import FantaApp
+    FantaApp().run()
+    return 0
+
 
 if __name__ == "__main__":
-    _main()
+    raise SystemExit(main())
